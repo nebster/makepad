@@ -49,6 +49,11 @@ pub struct DirectApp {
     cursor: crate::cursor::MouseCursor,
     #[cfg(use_vulkan)]
     first_frame_submitted: bool,
+    /// The (layout generation, DPI factor bits) last published to
+    /// `screens()`; `direct_publish_screens` skips its work when neither
+    /// moved.
+    #[cfg(use_vulkan)]
+    published_screens: Option<(u64, u64)>,
     // Dropped after the display/input resources on normal event-loop exit.
     _terminal: Option<DirectTerminal>,
 }
@@ -102,6 +107,8 @@ impl DirectApp {
             cursor: Default::default(),
             #[cfg(use_vulkan)]
             first_frame_submitted: false,
+            #[cfg(use_vulkan)]
+            published_screens: None,
             width,
             height,
             #[cfg(not(use_vulkan))]
@@ -403,6 +410,7 @@ impl Cx {
             Ok(None) => {}
             Err(error) => crate::error!("Direct Vulkan: display reconcile failed: {error}"),
         }
+        #[cfg(all(use_vulkan, target_os = "linux", not(target_env = "ohos")))]
         self.direct_publish_screens(direct_app);
         if let Err(error) = presented {
             crate::error!("Direct Vulkan: output presentation failed: {error}");
@@ -410,15 +418,31 @@ impl Cx {
     }
 
     /// Publish the wide desktop's screens for `screens()`, in the main
-    /// window's coordinates. Cheap: it reads the renderer's bookkeeping.
-    #[cfg(use_vulkan)]
-    fn direct_publish_screens(&mut self, direct_app: &DirectApp) {
+    /// window's coordinates. Cheap: it reads the renderer's bookkeeping, and
+    /// skips rebuilding and republishing the list when neither the layout
+    /// generation nor the DPI factor moved since the last publish.
+    ///
+    /// Gated like `crate::screen::set_linux_screens` itself: Android and
+    /// OHOS builds that happen to set `linux_direct,vulkan` (`linux_direct`
+    /// and `use_vulkan` are plain `MAKEPAD=` config flags, not implied by the
+    /// target) have `Cx::linux_display_snapshot` but not that function.
+    #[cfg(all(use_vulkan, target_os = "linux", not(target_env = "ohos")))]
+    fn direct_publish_screens(&self, direct_app: &mut DirectApp) {
         let window_id = CxWindowPool::id_zero();
         let dpi_factor = if self.windows.is_valid(window_id) && self.windows[window_id].is_created {
             self.windows[window_id].effective_dpi_factor()
         } else {
             direct_app.dpi_factor
         };
+        let generation = self
+            .os
+            .vulkan
+            .as_ref()
+            .map_or(0, |vulkan| vulkan.direct_layout_generation());
+        let key = (generation, dpi_factor.to_bits());
+        if direct_app.published_screens == Some(key) {
+            return;
+        }
         let snapshot = self.linux_display_snapshot();
         let screens = snapshot
             .outputs
@@ -433,6 +457,7 @@ impl Cx {
             })
             .collect();
         crate::screen::set_linux_screens(screens);
+        direct_app.published_screens = Some(key);
     }
 
     /// The render source changed its native size: the logical desktop is that

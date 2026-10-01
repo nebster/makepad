@@ -1305,6 +1305,11 @@ pub(super) struct DirectState {
     preferred_source: Option<String>,
     /// Saved left-to-right order of connector names for the wide desktop.
     preferred_order: Vec<String>,
+    /// Bumped (`wrapping_add(1)`) every time `direct_reconcile` gets past its
+    /// "nothing to do" early return: hotplug, retries, main-screen and order
+    /// requests all set `scan_dirty` first. `screens()` republishes only
+    /// when this, or the DPI factor, moved since the last publish.
+    layout_generation: u64,
     /// A source request accepted but not yet applied at a frame boundary.
     pending_source: Option<String>,
     source_name: Option<String>,
@@ -2225,6 +2230,7 @@ impl CxVulkan {
                 scan_dirty: false,
                 preferred_source: None,
                 preferred_order: Vec::new(),
+                layout_generation: 0,
                 pending_source: None,
                 source_name: None,
                 source_switch_failures: 0,
@@ -4059,6 +4065,7 @@ impl CxVulkan {
         if !direct.scan_dirty && !retry_due && !source_retry_due {
             return Ok(None);
         }
+        direct.layout_generation = direct.layout_generation.wrapping_add(1);
         let scan_changed = std::mem::take(&mut direct.scan_dirty);
         let connected = direct.connected.clone();
 
@@ -5525,6 +5532,19 @@ impl CxVulkan {
             direct: true,
             outputs,
         }
+    }
+
+    /// Current layout generation: bumped whenever outputs, statuses, the
+    /// main screen or the order could have changed. 0 when there is no
+    /// direct state (routed presenter not yet attached, or offscreen).
+    pub(crate) fn direct_layout_generation(&self) -> u64 {
+        if let Some(routed) = &self.desktop.routed {
+            return routed.display.direct_layout_generation();
+        }
+        self.desktop
+            .direct
+            .as_ref()
+            .map_or(0, |direct| direct.layout_generation)
     }
 }
 
