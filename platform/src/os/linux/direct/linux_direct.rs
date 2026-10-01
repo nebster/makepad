@@ -403,9 +403,36 @@ impl Cx {
             Ok(None) => {}
             Err(error) => crate::error!("Direct Vulkan: display reconcile failed: {error}"),
         }
+        self.direct_publish_screens(direct_app);
         if let Err(error) = presented {
             crate::error!("Direct Vulkan: output presentation failed: {error}");
         }
+    }
+
+    /// Publish the wide desktop's screens for `screens()`, in the main
+    /// window's coordinates. Cheap: it reads the renderer's bookkeeping.
+    #[cfg(use_vulkan)]
+    fn direct_publish_screens(&mut self, direct_app: &DirectApp) {
+        let window_id = CxWindowPool::id_zero();
+        let dpi_factor = if self.windows.is_valid(window_id) && self.windows[window_id].is_created {
+            self.windows[window_id].effective_dpi_factor()
+        } else {
+            direct_app.dpi_factor
+        };
+        let snapshot = self.linux_display_snapshot();
+        let screens = snapshot
+            .outputs
+            .iter()
+            .filter_map(|output| {
+                let (x, y) = output.desktop_position?;
+                let bounds = Rect {
+                    pos: dvec2(x as f64 / dpi_factor, y as f64 / dpi_factor),
+                    size: dvec2(output.width as f64 / dpi_factor, output.height as f64 / dpi_factor),
+                };
+                Some(crate::screen::ScreenGeom { bounds, work_area: bounds, is_primary: output.primary })
+            })
+            .collect();
+        crate::screen::set_linux_screens(screens);
     }
 
     /// The render source changed its native size: the logical desktop is that

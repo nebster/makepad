@@ -37,11 +37,33 @@ pub fn screens() -> Vec<ScreenGeom> {
     crate::os::apple::macos::macos_window::macos_screens()
 }
 
+/// The screens the Linux direct backend arranged into its wide desktop, in
+/// window coordinates (native pixels divided by the window's DPI factor).
+/// Empty for other Linux backends.
+#[cfg(all(not(gpusim), target_os = "linux", not(target_env = "ohos")))]
+static LINUX_SCREENS: std::sync::Mutex<Vec<ScreenGeom>> = std::sync::Mutex::new(Vec::new());
+
+/// Every display attached right now, in the platform's window-position space:
+/// on Linux, the direct backend's wide desktop (empty for other backends).
+#[cfg(all(not(gpusim), target_os = "linux", not(target_env = "ohos")))]
+pub fn screens() -> Vec<ScreenGeom> {
+    LINUX_SCREENS.lock().map(|screens| screens.clone()).unwrap_or_default()
+}
+
+/// Published by the direct backend whenever its desktop layout may change.
+#[cfg(all(not(gpusim), target_os = "linux", not(target_env = "ohos")))]
+pub(crate) fn set_linux_screens(screens: Vec<ScreenGeom>) {
+    if let Ok(mut current) = LINUX_SCREENS.lock() {
+        *current = screens;
+    }
+}
+
 /// A backend with no display list to offer answers with none; a caller
 /// then keeps its window where the system put it.
 #[cfg(not(any(
     all(not(gpusim), target_os = "windows"),
-    all(not(gpusim), target_os = "macos")
+    all(not(gpusim), target_os = "macos"),
+    all(not(gpusim), target_os = "linux", not(target_env = "ohos"))
 )))]
 pub fn screens() -> Vec<ScreenGeom> {
     Vec::new()
