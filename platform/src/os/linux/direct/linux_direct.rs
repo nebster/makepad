@@ -410,7 +410,7 @@ impl Cx {
             Ok(None) => {}
             Err(error) => crate::error!("Direct Vulkan: display reconcile failed: {error}"),
         }
-        #[cfg(all(use_vulkan, target_os = "linux", not(target_env = "ohos")))]
+        #[cfg(all(not(gpusim), use_vulkan, target_os = "linux", not(target_env = "ohos")))]
         self.direct_publish_screens(direct_app);
         if let Err(error) = presented {
             crate::error!("Direct Vulkan: output presentation failed: {error}");
@@ -426,7 +426,7 @@ impl Cx {
     /// OHOS builds that happen to set `linux_direct,vulkan` (`linux_direct`
     /// and `use_vulkan` are plain `MAKEPAD=` config flags, not implied by the
     /// target) have `Cx::linux_display_snapshot` but not that function.
-    #[cfg(all(use_vulkan, target_os = "linux", not(target_env = "ohos")))]
+    #[cfg(all(not(gpusim), use_vulkan, target_os = "linux", not(target_env = "ohos")))]
     fn direct_publish_screens(&self, direct_app: &mut DirectApp) {
         let window_id = CxWindowPool::id_zero();
         let dpi_factor = if self.windows.is_valid(window_id) && self.windows[window_id].is_created {

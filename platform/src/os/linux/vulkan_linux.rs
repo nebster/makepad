@@ -3859,6 +3859,15 @@ impl CxVulkan {
                 }
             }
         }
+        // Bump the layout generation here too, independent of `direct_reconcile`'s
+        // bump: a routed resize can be deferred across a GPU transition and this
+        // runs later, from `routed_reconcile`'s composition install, with no
+        // further call into `direct_reconcile` to notice the change.
+        let previous_layout: Vec<(bool, Option<crate::linux_wide_desktop::SliceRect>)> = direct
+            .outputs
+            .iter()
+            .map(|output| (output.primary, output.desktop_rect))
+            .collect();
         for output in &mut direct.outputs {
             output.primary = false;
             output.desktop_rect = if direct.desktop_extent == extent {
@@ -3868,6 +3877,14 @@ impl CxVulkan {
             };
         }
         direct.outputs[target].primary = true;
+        if direct
+            .outputs
+            .iter()
+            .map(|output| (output.primary, output.desktop_rect))
+            .ne(previous_layout)
+        {
+            direct.layout_generation = direct.layout_generation.wrapping_add(1);
+        }
         if explicit_target && !(needs_swap && direct.defer_composition_resize) {
             direct.pending_source = None;
         }
