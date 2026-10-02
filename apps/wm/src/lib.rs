@@ -5684,7 +5684,17 @@ impl AppMain for App {
             }
             self.wifi_shutdown();
             #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-            self.shutdown_linux_controls();
+            {
+                self.shutdown_linux_controls();
+                // "Restart desktop now": exit 75, which the systemd units
+                // restart (`RestartForceExitStatus`/`SuccessExitStatus`).
+                // An ordinary quit is left alone and still exits 0 through
+                // the platform's own shutdown path.
+                let code = linux_controls::exit_code(self.restart_requested());
+                if code != 0 {
+                    std::process::exit(code);
+                }
+            }
         }
         if let Event::Timer(te) = event {
             if self.tick.is_timer(te).is_some() && self.state.is_some() {

@@ -39,8 +39,8 @@ use shell::display_layout::{
 };
 use shell::panels::{PanelKind, ShellPanel};
 use shell::system_linux::{
-    validate_display_source, validate_gpu_choice, BatteryStatus, CommandResult, SystemCommand,
-    SystemController, DISPLAY_SCALE_MAX, DISPLAY_SCALE_MIN,
+    validate_display_source, validate_gpu_choice, BatteryStatus, CommandResult, GpuInfo, Seq,
+    SystemCommand, SystemController, DISPLAY_SCALE_MAX, DISPLAY_SCALE_MIN,
 };
 use std::collections::VecDeque;
 
@@ -59,8 +59,8 @@ pub enum ControlAction {
     Brightness(u32),
     /// The display scale in hundredths (130 = 1.30×), emitted on release.
     DpiScale(u32),
-    /// The "Optimize for" output: a connector name from the renderer's
-    /// inventory, whose native pixels define the shared framebuffer.
+    /// Make screen `name` the main screen (where the dock goes): a
+    /// connector name from the renderer's inventory.
     DisplaySource(String),
     /// The screens of the desktop in this new left-to-right order
     /// (connector names, a neighbour swap of the drawn order): applied
@@ -157,6 +157,19 @@ pub struct LinuxControls {
     /// Armed by a main-window geometry change: the frame after it, the open
     /// flyout re-reads its bar module's rect, which the bar has re-laid out.
     reanchor_frame: NextFrame,
+    /// "Restart desktop now" was confirmed (the saved render-on GPU was
+    /// present at the time): `poll_linux_controls` calls `cx.quit()` once
+    /// the pending or last `SaveDisplayLayout`'s outcome has landed, and
+    /// `Event::Shutdown` reads this to exit 75 instead of 0. Cleared back
+    /// to `false` if that save fails instead, abandoning the restart (the
+    /// worker's own failure notice stands).
+    restart_requested: bool,
+    /// `cx.quit()` has already been called for the armed restart, so a
+    /// later poll (before `Event::Shutdown` arrives) does not call it again.
+    restart_quit_called: bool,
+    /// The sequence of the `SaveDisplayLayout` a restart (or an ordinary
+    /// edit) is waiting on, until its outcome (success or failure) lands.
+    layout_save_seq: Option<Seq>,
 }
 
 /// `slot`'s layout to send now: nothing until the start-up read has been
@@ -183,6 +196,26 @@ fn main_restore_confirms(sent: Option<(u64, f64)>, generation: u64, now: f64) ->
 
 fn valid_dpi(dpi: f64) -> bool {
     dpi.is_finite() && dpi > 0.0
+}
+
+/// Whether "Restart desktop now" can still do something: the saved
+/// render-on choice (`None` is Auto, always present) resolves to a GPU
+/// this boot lists. Mirrors the panel's own pre-press check (the same
+/// shape as its `saved_gpu_present`): once the saved GPU is gone, a
+/// restart would only fall back to Auto, which is not what was promised,
+/// so it is refused and reported instead.
+fn restart_gate(saved: Option<&str>, gpus: &[GpuInfo]) -> bool {
+    saved.map_or(true, |identity| gpus.iter().any(|gpu| gpu.matches(identity)))
+}
+
+/// The process exit code for `Event::Shutdown`: `75` (`EX_TEMPFAIL`) once
+/// "Restart desktop now" asked for one, so systemd's
+/// `RestartForceExitStatus=75`/`SuccessExitStatus=75` treats it as a
+/// deliberate, successful restart and starts the WM again (re-running the
+/// session script, which re-reads `display-layout`); `0`, unchanged, for
+/// an ordinary quit, which both units leave down.
+pub(crate) fn exit_code(restart_requested: bool) -> i32 {
+    if restart_requested { 75 } else { 0 }
 }
 
 impl LinuxControls {
@@ -398,11 +431,40 @@ impl App {
                 true
             }
             Err(message) => {
-                self.linux_controls.notice = format!("Optimize for {name}: {message}");
+                self.linux_controls.notice = format!("Make main {name}: {message}");
                 log!("wm: display source {name} refused: {message}");
                 false
             }
         }
+    }
+
+    /// "Restart desktop now", confirmed. The panel re-checked the saved
+    /// render-on GPU was present right before sending this; the click and
+    /// this handler can straddle a poll, so it is checked again here
+    /// against the panel's own cached fields (`render_on_saved`,
+    /// `system.gpus`) with the same `restart_gate` the panel's own check
+    /// uses. Once armed, `poll_linux_controls` calls `cx.quit()` as soon
+    /// as the pending or last `SaveDisplayLayout`'s outcome has landed
+    /// (`layout_save`/`layout_save_seq` both empty); `Event::Shutdown`
+    /// then exits 75. A save that fails instead cancels the restart there
+    /// and leaves the worker's own failure notice standing.
+    fn request_restart(&mut self, cx: &mut Cx) {
+        self.linux_controls.notice.clear();
+        let panel = self.ui.widget(cx, ids!(shell_panel));
+        let (saved, gpus) = panel
+            .borrow::<ShellPanel>()
+            .map(|p| (p.render_on_saved.clone(), p.system.gpus.clone()))
+            .unwrap_or((None, Vec::new()));
+        if restart_gate(saved.as_deref(), &gpus) {
+            self.linux_controls.restart_requested = true;
+            self.linux_controls.restart_quit_called = false;
+            log!("wm: restart desktop requested, waiting for the display layout save to land");
+        } else {
+            self.linux_controls.notice = "Restart desktop now: the saved GPU is no longer present".into();
+            log!("wm: restart desktop refused: saved render-on GPU is no longer present");
+        }
+        self.poll_linux_controls(cx);
+        self.redraw_all(cx);
     }
 
     /// An open flyout follows its bar module: after the bar re-lays out
@@ -482,7 +544,7 @@ impl App {
                         }
                     }
                     Ok(_) => {}
-                    Err(message) => self.linux_controls.notice = format!("Optimize for: {message}"),
+                    Err(message) => self.linux_controls.notice = format!("Make main: {message}"),
                 }
                 self.poll_linux_controls(cx);
                 self.redraw_all(cx);
@@ -503,10 +565,7 @@ impl App {
                 return;
             }
             ControlAction::RestartDesktop => {
-                // The restart itself (exit 75, which the service restarts)
-                // comes with the restart task; until then the request is
-                // only logged.
-                log!("wm: restart desktop requested (not wired yet)");
+                self.request_restart(cx);
                 return;
             }
             ControlAction::GpuChoice(choice) => {
@@ -639,10 +698,10 @@ impl App {
                     }
                 }
                 if let Some(layout) = take_layout_save(state.layout_loaded, &mut state.layout_save) {
-                    if let Err(SystemCommand::SaveDisplayLayout(layout)) =
-                        controller.send(SystemCommand::SaveDisplayLayout(layout))
-                    {
-                        state.layout_save = Some(layout);
+                    match controller.send(SystemCommand::SaveDisplayLayout(layout)) {
+                        Ok(seq) => state.layout_save_seq = Some(seq),
+                        Err(SystemCommand::SaveDisplayLayout(layout)) => state.layout_save = Some(layout),
+                        Err(_) => {}
                     }
                 }
                 for i in 0..2 {
@@ -668,6 +727,14 @@ impl App {
                     | state.layout_save.take().is_some()
                     | state.pointer_save[0].take().is_some()
                     | state.pointer_save[1].take().is_some();
+                state.layout_save_seq = None;
+                if state.restart_requested && !state.restart_quit_called {
+                    // The worker is gone: no `Applied` can ever land, so the
+                    // restart cannot be confirmed. Leaving is pointless too
+                    // (the saved layout may be stale), so it is abandoned.
+                    state.restart_requested = false;
+                    log!("wm: restart desktop cancelled: system controls stopped");
+                }
                 state.notice = if unsaved {
                     "Setting applied, but not saved: system controls stopped".into()
                 } else {
@@ -679,13 +746,36 @@ impl App {
                 if state.seen.contains(&outcome.seq) { continue; }
                 if state.seen.len() == 64 { state.seen.pop_front(); }
                 state.seen.push_back(outcome.seq);
+                if state.layout_save_seq == Some(outcome.seq) {
+                    state.layout_save_seq = None;
+                    if matches!(outcome.result, CommandResult::Failed(_)) && state.restart_requested {
+                        state.restart_requested = false;
+                        log!("wm: restart desktop cancelled: the display layout save failed");
+                    }
+                }
                 if let CommandResult::Failed(message) = &outcome.result {
                     state.notice = message.clone();
                     log!("wm: system control {:?} failed: {}", outcome.kind, message);
                 }
             }
+            if state.restart_requested
+                && !state.restart_quit_called
+                && state.layout_save.is_none()
+                && state.layout_save_seq.is_none()
+            {
+                state.restart_quit_called = true;
+                log!("wm: display layout saved; restarting the desktop");
+                cx.quit();
+            }
             Some(snapshot)
-        } else { None };
+        } else {
+            if state.restart_requested && !state.restart_quit_called {
+                // No controller at all: the same as the worker having died.
+                state.restart_requested = false;
+                log!("wm: restart desktop cancelled: system controls are unavailable");
+            }
+            None
+        };
         // The saved settings, once each. A late read after the person
         // already acted is ignored; nothing saved means the launch (scale)
         // or the renderer's own (layout) default stands.
@@ -787,7 +877,7 @@ impl App {
                     changed = true;
                 } else if expired {
                     if let Some((name, _)) = panel.display_source_pending.take() {
-                        state.notice = format!("Optimize for {name}: the renderer did not switch to it");
+                        state.notice = format!("Make main {name}: the renderer did not switch to it");
                         log!("wm: {}", state.notice);
                     }
                     changed = true;
@@ -1031,8 +1121,17 @@ impl App {
         self.linux_controls.waiting.clear();
         self.linux_controls.dpi_save = None;
         self.linux_controls.layout_save = None;
+        self.linux_controls.layout_save_seq = None;
         self.linux_controls.gpu_after_commit = None;
         self.linux_controls.pointer_save = [None; 2];
+        // `restart_requested` is left as it is: `Event::Shutdown`'s glue
+        // reads it right after this call to pick the exit code.
+    }
+
+    /// Whether `Event::Shutdown` should exit 75 (a confirmed restart)
+    /// instead of 0 (an ordinary quit).
+    pub(crate) fn restart_requested(&self) -> bool {
+        self.linux_controls.restart_requested
     }
 }
 
@@ -1043,6 +1142,31 @@ mod tests {
 
     fn layout(text: &str) -> DisplayLayout {
         DisplayLayout::parse(text)
+    }
+
+    #[test]
+    fn exit_code_is_75_only_for_a_requested_restart() {
+        assert_eq!(exit_code(false), 0);
+        assert_eq!(exit_code(true), 75);
+    }
+
+    #[test]
+    fn restart_gate_only_for_a_saved_gpu_that_is_present() {
+        let gpu = GpuInfo {
+            card: "card1".into(),
+            pci: "0000:01:00.0".into(),
+            vendor: "10de".into(),
+            device: "2b85".into(),
+            driver: "nvidia".into(),
+            connected: Vec::new(),
+        };
+        // Auto is always present: a restart cannot be stuck on a GPU.
+        assert!(restart_gate(None, &[]));
+        assert!(restart_gate(Some("0000:01:00.0 10de:2b85"), std::slice::from_ref(&gpu)));
+        // A moved card or another model at that address: the next start
+        // would only fall back to Auto, so the restart is refused.
+        assert!(!restart_gate(Some("0000:02:00.0 10de:2b85"), std::slice::from_ref(&gpu)));
+        assert!(!restart_gate(Some("0000:01:00.0 10de:2b84"), &[gpu]));
     }
 
     #[test]
