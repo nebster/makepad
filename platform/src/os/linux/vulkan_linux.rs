@@ -1302,6 +1302,7 @@ impl CxVulkan {
             (Box::new(old), Some(RetiredRenderer::PresenterCache))
         };
         // A routed display only presents; it never creates peers.
+        debug_assert!(display.desktop.peers.is_empty(), "GPU transitions are refused while peers exist");
         display.desktop.peer_spawner = None;
         self.desktop.routed = Some(RoutedCompositor {
             display,
@@ -2378,8 +2379,10 @@ impl CxVulkan {
 
             // Pass 2: acquire every connector the selected GPU owns and pick
             // its mode. A `MAKEPAD_DRM_MODES` entry takes precedence per
-            // connector; `MAKEPAD_DRM_MODE` applies to the first (best ranked)
-            // connector without an entry.
+            // connector; `MAKEPAD_DRM_MODE` goes to the first (best ranked)
+            // connector without a `MAKEPAD_DRM_MODES` entry whose mode plan
+            // succeeds — a connector without an entry that fails to plan
+            // does not consume it, so it still reaches a later connector.
             let mut global_mode_used = false;
             let mut plans: Vec<(
                 DrmConnector,
@@ -3996,12 +3999,14 @@ impl CxVulkan {
         }
         let name = direct.outputs[target].connector.name.clone();
         if direct.source_name.as_deref() != Some(name.as_str()) {
-            crate::log!(
-                "Vulkan direct: main screen {name}; wide desktop {}x{}; main screen at {:.3} Hz",
-                extent.width,
-                extent.height,
-                direct.outputs[target].refresh_hz()
-            );
+            if direct.external_layout.is_none() {
+                crate::log!(
+                    "Vulkan direct: main screen {name}; wide desktop {}x{}; main screen at {:.3} Hz",
+                    extent.width,
+                    extent.height,
+                    direct.outputs[target].refresh_hz()
+                );
+            }
             direct.source_name = Some(name);
         }
         Ok(installed)
@@ -4122,6 +4127,13 @@ impl CxVulkan {
     /// Creates a peer for every other card that has a connected screen this
     /// renderer cannot drive. A card that fails is retried with a doubling
     /// interval, and its error is logged only when it changes.
+    ///
+    /// Runs on the UI thread, so a newly connected card's peer is created
+    /// there too (a one-off hitch on card hotplug). `MAKEPAD_DRM_DEVICE`
+    /// limits the initial connector scan to one card, so no other card's
+    /// connectors are ever marked "another GPU" and no peers are created;
+    /// `MAKEPAD_DRM_CONNECTOR` does not apply here, since each peer's filter
+    /// selects its card only, leaving `connector: None`.
     fn direct_create_peers(&mut self) {
         let Some(spawner) = self.desktop.peer_spawner.clone() else {
             return;
@@ -6008,7 +6020,11 @@ impl CxVulkan {
                 // not merely not yet laid out: say so instead of `active`'s
                 // generic status.
                 let status = if active && output.desktop_rect.is_none() && desktop_non_empty {
-                    "active: not in the wide desktop (exceeds GPU limits)".to_string()
+                    if direct.external_layout.is_some() {
+                        "active: waiting for the wide desktop layout".to_string()
+                    } else {
+                        "active: not in the wide desktop (exceeds GPU limits)".to_string()
+                    }
                 } else {
                     output.status.clone()
                 };
@@ -6074,7 +6090,8 @@ impl CxVulkan {
 
 /// `MAKEPAD_DRM_MODES` names a display mode per connector, e.g.
 /// `card0-HDMI-A-2=3840x2160@30,card1-DP-1=1920x1080`, for links that cannot
-/// carry a screen's fastest native mode.
+/// carry a screen's fastest native mode. `MAKEPAD_DRM_MODE` (no connector)
+/// goes to the first connector with no entry here whose mode plan succeeds.
 #[cfg(linux_direct)]
 fn connector_mode_override(name: &str) -> Option<String> {
     let text = std::env::var("MAKEPAD_DRM_MODES").ok()?;
