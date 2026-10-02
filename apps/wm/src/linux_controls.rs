@@ -120,6 +120,10 @@ pub struct LinuxControls {
     layout_restore_sent: Vec<RestoreOp>,
     /// The saved main screen, still joining, has been asked for early once.
     main_early_tried: bool,
+    /// The display generation and time the restore last sent an order or
+    /// mode request: the reacquire it starts can outlast the main screen's
+    /// 5 s confirm, so the confirm waits for it (`main_restore_confirms`).
+    layout_restore_sent_at: Option<(u64, f64)>,
     /// Accepted compositor switch whose persistence waits until
     /// `finish_linux_gpu_choice`. `Some(None)` is the display GPU.
     gpu_after_commit: Option<Option<String>>,
@@ -147,6 +151,21 @@ pub struct LinuxControls {
 /// the file held.
 fn take_layout_save(loaded: bool, slot: &mut Option<DisplayLayout>) -> Option<DisplayLayout> {
     if loaded { slot.take() } else { None }
+}
+
+/// Whether the start-up restore's main-screen request gets the bounded
+/// pending confirm. Not while an order or mode request the restore sent
+/// (at generation `sent.0`, time `sent.1`) may still be reacquiring: the
+/// renderer has to have moved past that generation and the confirm's own
+/// span has to have passed since the send, else a slow reacquire would
+/// show a false "did not switch" notice.
+fn main_restore_confirms(sent: Option<(u64, f64)>, generation: u64, now: f64) -> bool {
+    match sent {
+        None => true,
+        Some((sent_generation, sent_time)) => {
+            generation > sent_generation && now - sent_time > SOURCE_PENDING_TIMEOUT
+        }
+    }
 }
 
 fn valid_dpi(dpi: f64) -> bool {
@@ -183,22 +202,16 @@ impl LinuxControls {
     }
 
     /// The worker's start-up read: the working copy unless this session
-    /// already edited it first, in which case each part the person did not
-    /// touch (screens, render-on) comes from the read.
+    /// already edited it first, in which case it is merged in
+    /// (`DisplayLayout::merge_loaded`: the person's edits stand, every
+    /// other saved screen and an untouched render-on come from the read).
     /// Marks the read as taken in; a layout edited before it is queued
-    /// again, merged, so the file keeps what the person did not touch.
+    /// again, merged, so the whole-file save keeps what the file held.
     fn adopt_loaded_layout(&mut self, loaded: &DisplayLayout) {
         self.layout_loaded = true;
         match self.layout.as_mut() {
             None => self.layout = Some(loaded.clone()),
-            Some(layout) => {
-                if !self.layout_user_set {
-                    layout.screens = loaded.screens.clone();
-                }
-                if !self.gpu_user_set {
-                    layout.render_on = loaded.render_on.clone();
-                }
-            }
+            Some(layout) => layout.merge_loaded(loaded, self.layout_user_set, self.gpu_user_set),
         }
         if self.layout_edited {
             self.layout_save = self.layout.clone();
@@ -743,8 +756,8 @@ impl App {
         let since = *self.linux_controls.source_restore_since.get_or_insert(now);
         let timed_out = now - since > SOURCE_RESTORE_TIMEOUT;
         let mut asked = false;
+        let generation = cx.linux_display_generation();
         if !self.linux_controls.layout_restore_done {
-            let generation = cx.linux_display_generation();
             let laid_out = displays.outputs.iter().any(|o| o.desktop_position.is_some());
             if self.linux_controls.layout_restore_generation != Some(generation) && laid_out {
                 self.linux_controls.layout_restore_generation = Some(generation);
@@ -769,6 +782,7 @@ impl App {
                         RestoreOp::Main(_) => continue,
                     }
                     self.linux_controls.layout_restore_sent.push(op.clone());
+                    self.linux_controls.layout_restore_sent_at = Some((generation, now));
                     asked = true;
                 }
             }
@@ -801,10 +815,15 @@ impl App {
                 (Some(name), _) => match displays.outputs.iter().find(|o| o.name == name) {
                     Some(output) if output.active => {
                         log!("wm: applying saved main screen {name}");
-                        // Not confirmed against the 5 s bound when an order
-                        // or mode change went out with it: the reacquire
-                        // can take longer than that.
-                        self.request_display_source(cx, name, !asked);
+                        // Not confirmed against the 5 s bound while an order
+                        // or mode change the restore sent may still be
+                        // reacquiring: that can take longer.
+                        let confirm = main_restore_confirms(
+                            self.linux_controls.layout_restore_sent_at,
+                            generation,
+                            now,
+                        );
+                        self.request_display_source(cx, name, confirm);
                         asked = true;
                         true
                     }
@@ -873,6 +892,34 @@ mod tests {
         assert_eq!(queued.render_on, Some("0000:01:00.0 10de:2b85".to_string()));
         assert_eq!(queued.screens, saved.screens);
         assert_eq!(controls.take_layout_save(), None);
+    }
+
+    #[test]
+    fn early_main_pick_save_keeps_the_files_other_screens() {
+        let mut controls = LinuxControls::default();
+        // The person picked a main screen before the read landed.
+        controls.layout_set_by_person();
+        controls.edit_layout(None, |l| *l = layout("screen 0000:00:02.0 eDP-1 main\n"));
+        assert_eq!(controls.take_layout_save(), None);
+        controls.adopt_loaded_layout(&layout(
+            "screen 0000:01:00.0 DP-3 main mode=2560x1440@144\nscreen 0000:00:02.0 eDP-1\n",
+        ));
+        let queued = controls.take_layout_save().expect("merged layout re-queued");
+        assert_eq!(queued.screens.len(), 2);
+        assert!(queued.screens[0].main);
+        assert_eq!(queued.screens[1].key.connector, "DP-3");
+        assert_eq!(queued.screens[1].mode, Some("2560x1440@144".to_string()));
+        assert!(!queued.screens[1].main);
+    }
+
+    #[test]
+    fn main_restore_confirm_waits_for_a_sent_reacquire() {
+        assert!(main_restore_confirms(None, 3, 1.0));
+        // Order sent at generation 4, t = 10: no confirm on the same
+        // generation, nor before the confirm span has passed.
+        assert!(!main_restore_confirms(Some((4, 10.0)), 4, 20.0));
+        assert!(!main_restore_confirms(Some((4, 10.0)), 6, 12.0));
+        assert!(main_restore_confirms(Some((4, 10.0)), 6, 16.0));
     }
 
     #[test]

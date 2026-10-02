@@ -349,6 +349,36 @@ impl DisplayLayout {
     }
 }
 
+impl DisplayLayout {
+    /// Merges the file's start-up read into a working layout this session
+    /// edited before the read landed. Untouched parts come from the read.
+    /// When the screens were edited (`screens_edited`: a main pick, an
+    /// order or mode change), the edited entries stand, and every saved
+    /// entry they do not have is appended (including screens not connected
+    /// now), so a whole-file save never drops them; an appended entry
+    /// loses `main` when an edited one has it. `render_on_edited` keeps the
+    /// person's render-on GPU.
+    pub fn merge_loaded(&mut self, loaded: &DisplayLayout, screens_edited: bool, render_on_edited: bool) {
+        if screens_edited {
+            let has_main = self.screens.iter().any(|entry| entry.main);
+            for saved in &loaded.screens {
+                if !self.screens.iter().any(|entry| entry.key == saved.key) {
+                    let mut entry = saved.clone();
+                    if has_main {
+                        entry.main = false;
+                    }
+                    self.screens.push(entry);
+                }
+            }
+        } else {
+            self.screens = loaded.screens.clone();
+        }
+        if !render_on_edited {
+            self.render_on = loaded.render_on.clone();
+        }
+    }
+}
+
 /// One step of bringing the running desktop in line with the saved
 /// layout: the `Cx::linux_set_display_*` call it stands for.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -857,6 +887,36 @@ mod tests {
         assert!(!restore_waiting(&layout, &failed));
         assert!(!is_joining(&failed.outputs[1]));
         assert_eq!(restore_plan(&layout, &failed), vec![RestoreOp::Main("card0-HDMI-A-1".to_string())]);
+    }
+
+    #[test]
+    fn merge_loaded_keeps_saved_screens_behind_an_early_main_pick() {
+        // A main pick before the read: the working layout only knows the
+        // live screen. The file also holds a docked screen not connected now.
+        let mut working = DisplayLayout::parse("screen 0000:00:02.0 eDP-1 main\n");
+        let loaded = DisplayLayout::parse(
+            "render-on 0000:01:00.0 10de:2b85\n\
+             screen 0000:01:00.0 DP-3 main mode=2560x1440@144\n\
+             screen 0000:00:02.0 eDP-1 mode=1920x1200\n",
+        );
+        working.merge_loaded(&loaded, true, false);
+        assert_eq!(working.render_on, loaded.render_on);
+        assert_eq!(working.screens.len(), 2);
+        assert_eq!(working.screens[0].key, key("0000:00:02.0", "eDP-1"));
+        assert!(working.screens[0].main);
+        assert_eq!(working.screens[0].mode, None);
+        assert_eq!(working.screens[1].key, key("0000:01:00.0", "DP-3"));
+        assert!(!working.screens[1].main);
+        assert_eq!(working.screens[1].mode, Some("2560x1440@144".to_string()));
+    }
+
+    #[test]
+    fn merge_loaded_takes_untouched_parts_from_the_read() {
+        let mut working = DisplayLayout { render_on: Some("0000:01:00.0 10de:2b85".to_string()), screens: vec![] };
+        let loaded = DisplayLayout::parse("render-on 0000:00:02.0 8086:a780\nscreen 0000:00:02.0 HDMI-A-2 main\n");
+        working.merge_loaded(&loaded, false, true);
+        assert_eq!(working.render_on, Some("0000:01:00.0 10de:2b85".to_string()));
+        assert_eq!(working.screens, loaded.screens);
     }
 
     #[test]
