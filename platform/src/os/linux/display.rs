@@ -35,6 +35,18 @@ pub struct LinuxDisplayOutput {
     /// Human-readable state: `active`, `unsupported: …`, `failed: …`, `lost: …`.
     /// Failure text is the actual Vulkan/DRM error, never a guess from sysfs.
     pub status: String,
+    /// Every mode the connector offers (width, height, refresh Hz),
+    /// deduplicated and sorted by area then refresh, both descending. Empty
+    /// for a row this GPU has not acquired (unsupported or not yet started).
+    pub modes: Vec<(u32, u32, f64)>,
+    /// This connector's entry in the runtime mode-override table
+    /// (`MAKEPAD_DRM_MODES` / `linux_set_display_mode`), if any, regardless
+    /// of whether the connector has started yet.
+    pub mode_override: Option<String>,
+    /// The basename of `canonicalize(/sys/class/drm/<card>/device)`: the
+    /// card's PCI address, for joining this screen to the window manager's
+    /// GPU list. `None` when the sysfs link cannot be resolved.
+    pub pci: Option<String>,
 }
 
 /// Everything the renderer knows about connected displays.
@@ -64,6 +76,17 @@ impl crate::cx::Cx {
             .as_ref()
             .map(|vulkan| vulkan.direct_display_snapshot())
             .unwrap_or_default()
+    }
+
+    /// Bumps whenever the direct backend's screens, their positions, modes,
+    /// statuses or main screen may have changed since the last call; cheap,
+    /// for a caller to poll instead of re-reading and diffing the snapshot
+    /// every frame. `0` for a build with no direct backend.
+    pub fn linux_display_generation(&self) -> u64 {
+        self.os
+            .vulkan
+            .as_ref()
+            .map_or(0, |vulkan| vulkan.direct_layout_generation())
     }
 
     /// Ask the renderer to make the named output the main screen ("optimize
@@ -135,6 +158,11 @@ impl crate::cx::Cx {
     /// is empty.
     pub fn linux_display_snapshot(&self) -> LinuxDisplaySnapshot {
         LinuxDisplaySnapshot::default()
+    }
+
+    /// Builds with no direct backend never change their (empty) snapshot.
+    pub fn linux_display_generation(&self) -> u64 {
+        0
     }
 
     /// Only the direct Vulkan backend (`MAKEPAD=linux_direct,vulkan`) drives
