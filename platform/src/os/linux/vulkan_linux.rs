@@ -70,8 +70,10 @@ pub(super) struct DesktopState {
     /// Kept to create peers for cards whose first screen appears later.
     #[cfg(linux_direct)]
     pub(super) peer_spawner: Option<ThreadSpawner>,
+    /// Cards whose peer could not be created: the current retry interval
+    /// (doubling up to `RETRY_MAX`), the next attempt and the last error.
     #[cfg(linux_direct)]
-    pub(super) peer_retry_at: Option<Instant>,
+    pub(super) peer_retry: HashMap<PathBuf, (Duration, Instant, String)>,
 }
 
 /// Cleans up each successfully created parent when a later initialization step
@@ -1091,8 +1093,6 @@ struct CompositionTargets {
     extent: vk::Extent2D,
 }
 
-/// The compositor and its apps use `CxVulkan`'s device. Display ownership stays
-/// in a second context, so recreating the renderer never drops the Intel panel.
 #[cfg(linux_direct)]
 /// Another GPU's screens in the wide desktop. Its own direct renderer owns
 /// that card's connectors; after each frame the rendering GPU copies this
@@ -1109,8 +1109,15 @@ pub(super) struct PeerDisplay {
     slice: crate::linux_wide_desktop::SliceRect,
     /// The peer's layout generation last folded into the rendering GPU's layout.
     seen_generation: u64,
+    /// The peer's active screens (name, mode size) the last layout placed.
+    laid_out: Vec<(String, u32, u32)>,
+    /// The peer has not received the newest composition yet: send it as soon
+    /// as the bridge is writable, from a new frame or the retained one.
+    resend: bool,
     failure: Option<String>,
     retry_at: Option<Instant>,
+    /// The last per-tick error logged and when, to rate-limit repeats.
+    last_log: Option<(String, Instant)>,
 }
 
 /// A layout the rendering GPU imposes on a peer: the peer's composition size
@@ -1123,9 +1130,16 @@ struct ExternalLayout {
     rects: Vec<(String, crate::linux_wide_desktop::SliceRect)>,
 }
 
+/// First retry interval of a card whose peer could not be created.
 #[cfg(linux_direct)]
 const PEER_RETRY: Duration = Duration::from_secs(5);
 
+/// Per-tick peer errors repeat at most this often unless their text changes.
+#[cfg(linux_direct)]
+const PEER_LOG_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The compositor and its apps use `CxVulkan`'s device. Display ownership stays
+/// in a second context, so recreating the renderer never drops the Intel panel.
 #[cfg(linux_direct)]
 pub(super) struct RoutedCompositor {
     display: Box<CxVulkan>,
@@ -1264,7 +1278,7 @@ impl CxVulkan {
     ) -> Option<super::transition::RetiredRenderer> {
         use super::transition::RetiredRenderer;
         old.device_wait_idle();
-        let (display, retired) = if let Some(mut routed) = old.desktop.routed.take() {
+        let (mut display, retired) = if let Some(mut routed) = old.desktop.routed.take() {
             routed.display.device_wait_idle();
             if let Some(bridge) = routed.bridge.take() {
                 unsafe { bridge.destroy(&old, &routed.display) };
@@ -1286,6 +1300,8 @@ impl CxVulkan {
                 .defer_composition_resize = true;
             (Box::new(old), Some(RetiredRenderer::PresenterCache))
         };
+        // A routed display only presents; it never creates peers.
+        display.desktop.peer_spawner = None;
         self.desktop.routed = Some(RoutedCompositor {
             display,
             composition: Some(output.composition),
@@ -2360,8 +2376,10 @@ impl CxVulkan {
             direct.physical_device = selected;
 
             // Pass 2: acquire every connector the selected GPU owns and pick
-            // its mode; the mode override applies to the first (best ranked)
-            // connector only.
+            // its mode. A `MAKEPAD_DRM_MODES` entry takes precedence per
+            // connector; `MAKEPAD_DRM_MODE` applies to the first (best ranked)
+            // connector without an entry.
+            let mut global_mode_used = false;
             let mut plans: Vec<(
                 DrmConnector,
                 vk::DisplayKHR,
@@ -2390,9 +2408,10 @@ impl CxVulkan {
                     continue;
                 }
                 let connector_mode = connector_mode_override(&connector.name);
+                let uses_global_mode = connector_mode.is_none() && !global_mode_used;
                 let requested = connector_mode
                     .as_deref()
-                    .or(if plans.is_empty() { mode } else { None });
+                    .or(if uses_global_mode { mode } else { None });
                 let native_resolution = drm_native_resolution(fd, connector.id);
                 let planned = select_display_mode(
                     &direct.display_loader,
@@ -2413,7 +2432,10 @@ impl CxVulkan {
                     .map(|candidates| (mode, candidates))
                 });
                 match planned {
-                    Ok((mode, candidates)) => plans.push((connector, display, mode, candidates)),
+                    Ok((mode, candidates)) => {
+                        global_mode_used |= uses_global_mode;
+                        plans.push((connector, display, mode, candidates))
+                    }
                     Err(err) => {
                         diagnostics.push(format!("{}: {err}", connector.name));
                         direct.release_surface_and_display(vk::SurfaceKHR::null(), display);
@@ -2525,6 +2547,7 @@ impl CxVulkan {
         if let Ok(text) = std::env::var("MAKEPAD_DISPLAY_ORDER") {
             if let Some(direct) = renderer.desktop.direct.as_mut() {
                 direct.preferred_order = crate::linux_wide_desktop::parse_display_order(&text);
+                direct.scan_dirty = true;
             }
         }
         let compositor = if let Ok(pin) = std::env::var("MAKEPAD_VULKAN_COMPOSITOR_UUID") {
@@ -4077,17 +4100,27 @@ impl CxVulkan {
                 peer_direct.external_layout = Some(external);
                 peer_direct.scan_dirty = true;
             }
+            peer.laid_out = Self::direct_peer_screens(peer_direct);
             peer.slice = slice;
         }
     }
 
+    /// A peer's active screens as the layout saw them: name and mode size.
+    fn direct_peer_screens(direct: &DirectState) -> Vec<(String, u32, u32)> {
+        Self::direct_active_screens(direct)
+            .into_iter()
+            .map(|screen| (screen.name, screen.width, screen.height))
+            .collect()
+    }
+
     /// Creates a peer for every other card that has a connected screen this
-    /// renderer cannot drive. Failures are logged and retried later.
+    /// renderer cannot drive. A card that fails is retried with a doubling
+    /// interval, and its error is logged only when it changes.
     fn direct_create_peers(&mut self) {
         let Some(spawner) = self.desktop.peer_spawner.clone() else {
             return;
         };
-        if self.desktop.routed.is_some() {
+        if self.desktop.routed.is_some() || self.gpu_transition_pending() {
             return;
         }
         let Some(direct) = self.desktop.direct.as_ref() else {
@@ -4102,6 +4135,13 @@ impl CxVulkan {
         cards.sort();
         cards.dedup();
         cards.retain(|card| !self.desktop.peers.iter().any(|peer| &peer.card == card));
+        let now = Instant::now();
+        cards.retain(|card| {
+            self.desktop
+                .peer_retry
+                .get(card)
+                .map_or(true, |(_, at, _)| *at <= now)
+        });
         let mut added = false;
         for card in cards {
             let name = connector_card_name(&card);
@@ -4109,18 +4149,34 @@ impl CxVulkan {
             match Self::new_direct_presenter(None, &spawner, filter, false) {
                 Ok(display) => {
                     crate::log!("Vulkan direct: {name} joins the wide desktop; its slice is sent through a GPU bridge");
+                    self.desktop.peer_retry.remove(&card);
                     self.desktop.peers.push(PeerDisplay {
                         card,
                         display: Box::new(display),
                         bridge: None,
                         slice: Default::default(),
                         seen_generation: u64::MAX,
+                        laid_out: Vec::new(),
+                        resend: false,
                         failure: None,
                         retry_at: None,
+                        last_log: None,
                     });
                     added = true;
                 }
-                Err(error) => crate::warning!("Vulkan direct: {name} cannot join the wide desktop yet: {error}"),
+                Err(error) => {
+                    let previous = self.desktop.peer_retry.remove(&card);
+                    let interval = previous
+                        .as_ref()
+                        .map_or(PEER_RETRY, |(interval, _, _)| (*interval * 2).min(RETRY_MAX));
+                    if previous.as_ref().map(|(_, _, text)| text.as_str()) != Some(error.as_str()) {
+                        crate::warning!(
+                            "Vulkan direct: {name} cannot join the wide desktop yet: {error} (retrying in {}s)",
+                            interval.as_secs()
+                        );
+                    }
+                    self.desktop.peer_retry.insert(card, (interval, now + interval, error));
+                }
             }
         }
         if added {
@@ -4133,16 +4189,12 @@ impl CxVulkan {
     /// Before the rendering GPU's reconcile: peers apply their own hotplug,
     /// and any change in them makes the rendering GPU lay out again.
     fn direct_reconcile_peers_before(&mut self) {
-        let now = Instant::now();
-        if self.desktop.peer_retry_at.map_or(true, |at| at <= now) {
-            self.desktop.peer_retry_at = Some(now + PEER_RETRY);
-            self.direct_create_peers();
-        }
+        self.direct_create_peers();
         let mut peers = std::mem::take(&mut self.desktop.peers);
         let mut changed = false;
         for peer in &mut peers {
             if let Err(error) = peer.display.direct_reconcile_outputs() {
-                crate::error!("Vulkan direct: {} reconcile failed: {error}", peer.card.display());
+                Self::direct_peer_log(peer, format!("reconcile failed: {error}"));
             }
             let generation = peer.display.direct_layout_generation();
             if generation != peer.seen_generation {
@@ -4159,17 +4211,47 @@ impl CxVulkan {
     }
 
     /// After the rendering GPU's reconcile: peers take the layout it imposed,
-    /// and their bridges follow their slice size.
+    /// and their bridges follow their slice size. Taking the layout changes a
+    /// peer's generation by itself; only a change in its active screens
+    /// (hotplug noticed during this pass) makes the rendering GPU lay out
+    /// again, and its generation stays unseen so the next pass notices too.
     fn direct_reconcile_peers_after(&mut self) {
         let mut peers = std::mem::take(&mut self.desktop.peers);
+        let mut changed = false;
         for peer in &mut peers {
             if let Err(error) = peer.display.direct_reconcile_outputs() {
-                crate::error!("Vulkan direct: {} reconcile failed: {error}", peer.card.display());
+                Self::direct_peer_log(peer, format!("reconcile failed: {error}"));
             }
-            peer.seen_generation = peer.display.direct_layout_generation();
+            let generation = peer.display.direct_layout_generation();
+            if generation != peer.seen_generation {
+                let screens = peer.display.desktop.direct.as_ref().map(Self::direct_peer_screens);
+                if screens.is_some_and(|screens| screens != peer.laid_out) {
+                    changed = true;
+                } else {
+                    peer.seen_generation = generation;
+                }
+            }
             self.direct_ensure_peer_bridge(peer);
         }
         self.desktop.peers = peers;
+        if changed {
+            if let Some(direct) = self.desktop.direct.as_mut() {
+                direct.scan_dirty = true;
+            }
+        }
+    }
+
+    /// Logs a per-tick peer error when its text changes, otherwise at most
+    /// once per `PEER_LOG_INTERVAL`.
+    fn direct_peer_log(peer: &mut PeerDisplay, message: String) {
+        let now = Instant::now();
+        let repeat = peer.last_log.as_ref().is_some_and(|(last, at)| {
+            *last == message && now.duration_since(*at) < PEER_LOG_INTERVAL
+        });
+        if !repeat {
+            crate::error!("Vulkan direct: {} {message}", peer.card.display());
+            peer.last_log = Some((message, now));
+        }
     }
 
     /// (Re)creates a peer's bridge once its composition has its slice's size.
@@ -4202,6 +4284,7 @@ impl CxVulkan {
                     peer.slice.y
                 );
                 peer.bridge = Some(bridge);
+                peer.resend = true;
                 peer.failure = None;
                 peer.retry_at = None;
             }
@@ -4216,58 +4299,64 @@ impl CxVulkan {
     }
 
     fn direct_peer_failed(peer: &mut PeerDisplay, error: String) {
-        crate::error!(
-            "Vulkan direct: {} transfer failed ({error}); its screens keep the last frame and retry",
-            peer.card.display()
+        Self::direct_peer_log(
+            peer,
+            format!("transfer failed ({error}); its screens keep the last frame and retry"),
         );
         peer.failure = Some(error);
+        peer.resend = true;
         peer.retry_at = Some(Instant::now() + Duration::from_secs(1));
     }
 
-    /// After a frame: send each peer its slice of `composition` (a busy peer
-    /// skips this frame), then let peers receive and present.
+    /// After a frame: each peer is owed its slice of `composition`. A busy
+    /// peer skips frames; it gets the newest composition once it is writable.
     fn direct_feed_peers(&mut self, desktop: vk::Extent2D, composition: vk::Image) {
         let mut peers = std::mem::take(&mut self.desktop.peers);
         for peer in &mut peers {
-            let slice = peer.slice;
-            let inside = slice.width > 0
-                && slice.height > 0
-                && slice.x + slice.width <= desktop.width
-                && slice.y + slice.height <= desktop.height;
-            let sized = vk::Extent2D { width: slice.width, height: slice.height };
-            if let Some(bridge) = peer.bridge.as_mut() {
-                if inside && peer.failure.is_none() && bridge.extent() == sized {
-                    let offset = vk::Offset2D { x: slice.x as i32, y: slice.y as i32 };
-                    let sent = match unsafe { bridge.writable(self, &peer.display) } {
-                        Ok(true) => unsafe { bridge.send_region(self, composition, offset) },
-                        Ok(false) => Ok(()),
-                        Err(error) => Err(error),
-                    };
-                    if let Err(error) = sent {
-                        Self::direct_peer_failed(peer, error);
-                    }
-                }
-            }
-            self.direct_service_peer(peer);
+            peer.resend = true;
+            self.direct_service_peer(peer, Some((desktop, composition)));
         }
         self.desktop.peers = peers;
     }
 
-    /// Lets every peer receive a pending slice and present.
-    fn direct_service_peers(&mut self) {
+    /// Lets every peer catch up on the retained composition (`main`: the
+    /// desktop extent and the composition image while it is valid), receive
+    /// a pending slice and present.
+    fn direct_service_peers(&mut self, main: Option<(vk::Extent2D, vk::Image)>) {
         let mut peers = std::mem::take(&mut self.desktop.peers);
         for peer in &mut peers {
-            self.direct_service_peer(peer);
+            self.direct_service_peer(peer, main);
         }
         self.desktop.peers = peers;
     }
 
-    fn direct_service_peer(&self, peer: &mut PeerDisplay) {
+    /// Sends the peer its slice of `main` when it is owed one, the bridge is
+    /// writable and the slice lies inside `main` at the bridge's size; then
+    /// receives a pending slice and presents.
+    fn direct_service_peer(&self, peer: &mut PeerDisplay, main: Option<(vk::Extent2D, vk::Image)>) {
         if peer.failure.is_none() {
             if let Some(bridge) = peer.bridge.as_mut() {
+                let resend = &mut peer.resend;
+                let slice = peer.slice;
                 let received = (|| -> Result<bool, String> {
                     if !unsafe { bridge.poll_initialization(self, &peer.display) }? {
                         return Ok(false);
+                    }
+                    if let Some((desktop, composition)) = main {
+                        let inside = slice.width > 0
+                            && slice.height > 0
+                            && slice.x + slice.width <= desktop.width
+                            && slice.y + slice.height <= desktop.height;
+                        let sized = vk::Extent2D { width: slice.width, height: slice.height };
+                        if *resend
+                            && inside
+                            && bridge.extent() == sized
+                            && unsafe { bridge.writable(self, &peer.display) }?
+                        {
+                            let offset = vk::Offset2D { x: slice.x as i32, y: slice.y as i32 };
+                            unsafe { bridge.send_region(self, composition, offset) }?;
+                            *resend = false;
+                        }
                     }
                     let Some((image, valid)) = peer.display.desktop.direct.as_ref().and_then(|direct| {
                         direct.composition.as_ref().map(|composition| (composition.image, direct.composition_valid))
@@ -4289,7 +4378,7 @@ impl CxVulkan {
             }
         }
         if let Err(error) = peer.display.direct_present_retained() {
-            crate::error!("Vulkan direct: {} presentation failed: {error}", peer.card.display());
+            Self::direct_peer_log(peer, format!("presentation failed: {error}"));
         }
     }
 
@@ -4939,7 +5028,11 @@ impl CxVulkan {
             direct.wait = DirectWait::GpuBusy;
         }
         self.desktop.direct = Some(direct);
-        self.direct_service_peers();
+        let main = self.desktop.direct.as_ref().and_then(|direct| {
+            let composition = direct.composition.as_ref().filter(|_| direct.composition_valid)?;
+            Some((direct.desktop_extent, composition.image))
+        });
+        self.direct_service_peers(main);
         result
     }
 
@@ -5968,7 +6061,6 @@ impl CxVulkan {
     }
 }
 
-#[cfg(linux_direct)]
 /// `MAKEPAD_DRM_MODES` names a display mode per connector, e.g.
 /// `card0-HDMI-A-2=3840x2160@30,card1-DP-1=1920x1080`, for links that cannot
 /// carry a screen's fastest native mode.
@@ -5981,6 +6073,7 @@ fn connector_mode_override(name: &str) -> Option<String> {
         .map(|(_, mode)| mode)
 }
 
+#[cfg(linux_direct)]
 fn connector_card_name(card: &Path) -> String {
     card.file_name()
         .map(|name| name.to_string_lossy().into_owned())
