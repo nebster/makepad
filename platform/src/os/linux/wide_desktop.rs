@@ -236,6 +236,9 @@ mod tests {
         let b = SliceRect { x: 5760, y: 0, width: 3840, height: 2160 };
         assert_eq!(bounding([a]), Some(a));
         assert_eq!(bounding([b, a]), Some(SliceRect { x: 3840, y: 0, width: 5760, height: 2160 }));
+        let low = SliceRect { x: 0, y: 200, width: 100, height: 50 };
+        let high = SliceRect { x: 150, y: 10, width: 100, height: 100 };
+        assert_eq!(bounding([low, high]), Some(SliceRect { x: 0, y: 10, width: 250, height: 240 }));
     }
 
     #[test]
