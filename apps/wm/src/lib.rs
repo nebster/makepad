@@ -39,6 +39,7 @@ mod dock_warp;
 mod host;
 mod hub;
 mod layout;
+mod screens;
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 mod linux_controls;
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
