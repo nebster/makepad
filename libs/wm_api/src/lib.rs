@@ -47,6 +47,11 @@ pub enum WmRequest {
     /// Ask the WM to float / tile / fullscreen this window.
     SetFloating { floating: bool },
     SetFullscreen { fullscreen: bool },
+    /// Ask the WM to make this window fullscreen across `span`'s screens
+    /// (`None` = leave fullscreen). `SetFullscreen { fullscreen }` is the
+    /// same as `Current` / `None`. The WM answers with a fresh
+    /// [`WmEvent::Screens`] whose `span` says what it actually did.
+    SetFullscreenSpan { span: Option<ScreenSpan> },
 }
 
 /// What the window manager tells an app.
@@ -77,6 +82,16 @@ pub enum WmEvent {
     /// its Space/Esc close the panel (`PreviewClose`).
     PreviewShown { path: String },
     PreviewHidden,
+    /// The live screens, left to right, in THIS window's coordinates (a
+    /// screen's rect minus the window's own origin), and the names of the
+    /// screens this window currently spans fullscreen (`None` when it
+    /// spans none). Sent when the window is first shown or adopted, and
+    /// again whenever the screens or the window's position change; read
+    /// it back with [`screens`].
+    Screens {
+        screens: Vec<WmScreen>,
+        span: Option<Vec<String>>,
+    },
 }
 
 // The wire envelope: `{"wm": ...}`. (The derives don't bound generics,
@@ -112,14 +127,74 @@ impl WmEvent {
         EventEnvelope { wm: self.clone() }.serialize_json()
     }
 
+    /// Parse a Custom message; `None` when it is not a WM event. A
+    /// [`WmEvent::Screens`] is also remembered for [`screens`], so an app
+    /// that parses its Custom messages (as every hosted app must to see
+    /// WM events at all) keeps that answer current without extra calls.
     pub fn parse(json: &str) -> Option<WmEvent> {
         if !json.contains("\"wm\"") {
             return None;
         }
-        EventEnvelope::deserialize_json(json)
-            .ok()
-            .map(|e| e.wm)
+        let ev = EventEnvelope::deserialize_json(json).ok().map(|e| e.wm)?;
+        if let WmEvent::Screens { screens, .. } = &ev {
+            *LAST_SCREENS.lock().unwrap_or_else(|p| p.into_inner()) = Some(screens.clone());
+        }
+        Some(ev)
     }
+}
+
+/// The last [`WmEvent::Screens`] list this process parsed (hosted only).
+static LAST_SCREENS: std::sync::Mutex<Option<Vec<WmScreen>>> = std::sync::Mutex::new(None);
+
+/// The live screens, left to right, in this window's coordinates.
+///
+/// Hosted: the last [`WmEvent::Screens`] the WM sent (empty until one
+/// arrives, and always empty under a host that never sends one, such as
+/// Studio's run view). Standalone: the platform's own screen list
+/// (`makepad_platform::screens()`), named by connector on Linux and
+/// `"screen0"`, `"screen1"`, ... elsewhere; on the Linux direct backend
+/// these are already in the (desktop-sized) window's coordinates.
+pub fn screens(cx: &Cx) -> Vec<WmScreen> {
+    if hosted(cx) {
+        let last = LAST_SCREENS.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        return last.unwrap_or_default();
+    }
+    standalone_screens(
+        &makepad_widgets_core::makepad_platform::screens(),
+        &makepad_widgets_core::makepad_platform::linux_screen_names(),
+    )
+}
+
+/// Platform screens as [`WmScreen`]s: `geoms[i]` named `names[i]`, or
+/// `"screen<i>"` where no connector name is known (non-Linux platforms
+/// have none).
+pub fn standalone_screens(
+    geoms: &[makepad_widgets_core::makepad_platform::ScreenGeom],
+    names: &[String],
+) -> Vec<WmScreen> {
+    geoms
+        .iter()
+        .enumerate()
+        .map(|(i, g)| WmScreen {
+            name: names
+                .get(i)
+                .filter(|n| !n.is_empty())
+                .cloned()
+                .unwrap_or_else(|| format!("screen{i}")),
+            x: g.bounds.pos.x,
+            y: g.bounds.pos.y,
+            w: g.bounds.size.x,
+            h: g.bounds.size.y,
+            primary: g.is_primary,
+        })
+        .collect()
+}
+
+/// Ask the WM to make this window fullscreen across `span` (`None` =
+/// leave fullscreen); the outcome arrives as a [`WmEvent::Screens`].
+/// Returns false when not hosted: nothing was asked.
+pub fn set_fullscreen_span(cx: &Cx, span: Option<ScreenSpan>) -> bool {
+    send(cx, &WmRequest::SetFullscreenSpan { span })
 }
 
 /// True when this process is hosted as an wm tile (or a Studio run view).
@@ -310,6 +385,62 @@ mod tests {
         };
         assert_eq!(WmEvent::parse(&ev.to_json()), Some(ev));
         assert_eq!(WmEvent::parse(&WmEvent::CloseRequested.to_json()), Some(WmEvent::CloseRequested));
+    }
+
+    fn screen(name: &str, x: f64, w: f64, primary: bool) -> WmScreen {
+        WmScreen { name: name.into(), x, y: 0.0, w, h: 1080.0, primary }
+    }
+
+    #[test]
+    fn span_request_round_trip() {
+        for span in [
+            None,
+            Some(ScreenSpan::Current),
+            Some(ScreenSpan::All),
+            Some(ScreenSpan::Screens(vec!["DP-1".into(), "HDMI-A-1".into()])),
+        ] {
+            let req = WmRequest::SetFullscreenSpan { span };
+            let json = req.to_json();
+            assert!(json.starts_with("{\"wm\":"), "{json}");
+            assert_eq!(WmRequest::parse(&json), Some(req));
+        }
+        let old = WmRequest::SetFullscreen { fullscreen: true };
+        assert_eq!(WmRequest::parse(&old.to_json()), Some(old));
+    }
+
+    #[test]
+    fn screens_event_round_trip() {
+        let ev = WmEvent::Screens {
+            screens: vec![screen("DP-1", -12.5, 1920.0, true), screen("HDMI-A-1", 1907.5, 2560.0, false)],
+            span: Some(vec!["DP-1".into()]),
+        };
+        assert_eq!(WmEvent::parse(&ev.to_json()), Some(ev));
+        let none = WmEvent::Screens { screens: Vec::new(), span: None };
+        assert_eq!(WmEvent::parse(&none.to_json()), Some(none));
+        // A Screens event is not a request, nor the raw tiled-fullscreen note.
+        assert_eq!(WmRequest::parse(&WmEvent::Screens { screens: Vec::new(), span: None }.to_json()), None);
+        assert!(WmEvent::parse(r#"{"wm_fullscreen":true}"#).is_none());
+    }
+
+    #[test]
+    fn standalone_screens_names_or_synthesizes() {
+        let geom = |x: f64, w: f64, primary: bool| ScreenGeom {
+            bounds: Rect { pos: dvec2(x, 0.0), size: dvec2(w, 1080.0) },
+            work_area: Rect { pos: dvec2(x, 0.0), size: dvec2(w, 1040.0) },
+            is_primary: primary,
+        };
+        let geoms = [geom(0.0, 1920.0, true), geom(1920.0, 2560.0, false)];
+        // Linux: connector names, index-aligned.
+        let named = standalone_screens(&geoms, &["DP-1".into(), "HDMI-A-1".into()]);
+        assert_eq!(named, vec![screen("DP-1", 0.0, 1920.0, true), screen("HDMI-A-1", 1920.0, 2560.0, false)]);
+        // Elsewhere: no names, so screen0.. by position in the list.
+        let synth = standalone_screens(&geoms, &[]);
+        assert_eq!(synth, vec![screen("screen0", 0.0, 1920.0, true), screen("screen1", 1920.0, 2560.0, false)]);
+        // A short or blank name list is filled in, never misaligned.
+        let partial = standalone_screens(&geoms, &["".into()]);
+        assert_eq!(partial[0].name, "screen0");
+        assert_eq!(partial[1].name, "screen1");
+        assert!(standalone_screens(&[], &["DP-1".into()]).is_empty());
     }
 
     #[test]

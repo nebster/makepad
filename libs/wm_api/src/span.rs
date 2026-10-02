@@ -2,10 +2,9 @@
 //! adjacent, or all screens into an index range and a bounding rect, with
 //! no platform or `Cx` dependency so it unit-tests without a display.
 //!
-//! `WmRequest`/`WmEvent` (see `lib.rs`) will carry [`ScreenSpan`] and
-//! [`WmScreen`] values over the wire once the protocol grows a span
-//! request (a later change); this module only resolves them against a
-//! screen list.
+//! `WmRequest::SetFullscreenSpan` and `WmEvent::Screens` (see `lib.rs`) carry
+//! [`ScreenSpan`] and [`WmScreen`] values over the wire; this module only
+//! resolves them against a screen list.
 
 use makepad_widgets_core::makepad_micro_serde::*;
 
