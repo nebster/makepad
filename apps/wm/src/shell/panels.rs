@@ -526,6 +526,13 @@ pub struct ShellPanel {
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     #[rust]
     restart_confirm: bool,
+    /// The restart was confirmed and is waiting for the display layout
+    /// save to land before the process exits (`LinuxControls::restart_requested`,
+    /// mirrored here every poll). The restart row shows "Restarting…"
+    /// while this holds, in place of the button or the confirm step.
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    #[rust]
+    pub restart_waiting: bool,
     /// The saved render-on GPU (`None` is Auto): the WM's working layout,
     /// so a pick shows at once. The render-on list checks it.
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]

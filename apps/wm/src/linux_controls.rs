@@ -51,6 +51,10 @@ const SOURCE_PENDING_TIMEOUT: f64 = 5.0;
 /// (`active` means a frame was shown) may wait for its first frame at
 /// start-up before the renderer's default is kept.
 const SOURCE_RESTORE_TIMEOUT: f64 = 10.0;
+/// How long a confirmed restart may wait for its `SaveDisplayLayout` to be
+/// confirmed before it is abandoned (a wedged worker thread: alive by
+/// `worker_alive()`'s own test, `!is_finished()`, but not answering).
+const RESTART_SAVE_TIMEOUT: f64 = 5.0;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ControlAction {
@@ -161,12 +165,16 @@ pub struct LinuxControls {
     /// present at the time): `poll_linux_controls` calls `cx.quit()` once
     /// the pending or last `SaveDisplayLayout`'s outcome has landed, and
     /// `Event::Shutdown` reads this to exit 75 instead of 0. Cleared back
-    /// to `false` if that save fails instead, abandoning the restart (the
-    /// worker's own failure notice stands).
+    /// to `false` if that save fails, times out (`RESTART_SAVE_TIMEOUT`)
+    /// or cannot be waited on at all (no controller, or the worker died),
+    /// abandoning the restart.
     restart_requested: bool,
     /// `cx.quit()` has already been called for the armed restart, so a
     /// later poll (before `Event::Shutdown` arrives) does not call it again.
     restart_quit_called: bool,
+    /// `Cx::monotonic_now()` when the restart was armed: `restart_timed_out`
+    /// measures the bounded wait for the save from here.
+    restart_since: Option<f64>,
     /// The sequence of the `SaveDisplayLayout` a restart (or an ordinary
     /// edit) is waiting on, until its outcome (success or failure) lands.
     layout_save_seq: Option<Seq>,
@@ -206,6 +214,16 @@ fn valid_dpi(dpi: f64) -> bool {
 /// so it is refused and reported instead.
 fn restart_gate(saved: Option<&str>, gpus: &[GpuInfo]) -> bool {
     saved.map_or(true, |identity| gpus.iter().any(|gpu| gpu.matches(identity)))
+}
+
+/// Whether an armed restart, confirmed at `since`, has waited too long at
+/// `now` for its `SaveDisplayLayout`'s outcome to land: past
+/// `RESTART_SAVE_TIMEOUT`, the same bounded-wait shape as
+/// `SOURCE_PENDING_TIMEOUT` elsewhere in this file. A wedged worker thread
+/// (alive by `worker_alive()`'s own test but never answering) would
+/// otherwise leave the restart waiting forever with no feedback.
+fn restart_timed_out(since: f64, now: f64) -> bool {
+    now - since > RESTART_SAVE_TIMEOUT
 }
 
 /// The process exit code for `Event::Shutdown`: `75` (`EX_TEMPFAIL`) once
@@ -443,11 +461,13 @@ impl App {
     /// this handler can straddle a poll, so it is checked again here
     /// against the panel's own cached fields (`render_on_saved`,
     /// `system.gpus`) with the same `restart_gate` the panel's own check
-    /// uses. Once armed, `poll_linux_controls` calls `cx.quit()` as soon
-    /// as the pending or last `SaveDisplayLayout`'s outcome has landed
+    /// uses. Once armed, `poll_linux_controls` shows "Restarting…" in the
+    /// panel (`restart_waiting`) and calls `cx.quit()` as soon as the
+    /// pending or last `SaveDisplayLayout`'s outcome has landed
     /// (`layout_save`/`layout_save_seq` both empty); `Event::Shutdown`
-    /// then exits 75. A save that fails instead cancels the restart there
-    /// and leaves the worker's own failure notice standing.
+    /// then exits 75. A save that fails, or does not land within
+    /// `RESTART_SAVE_TIMEOUT`, cancels the restart there instead and
+    /// reports it.
     fn request_restart(&mut self, cx: &mut Cx) {
         self.linux_controls.notice.clear();
         let panel = self.ui.widget(cx, ids!(shell_panel));
@@ -458,6 +478,7 @@ impl App {
         if restart_gate(saved.as_deref(), &gpus) {
             self.linux_controls.restart_requested = true;
             self.linux_controls.restart_quit_called = false;
+            self.linux_controls.restart_since = Some(Cx::monotonic_now());
             log!("wm: restart desktop requested, waiting for the display layout save to land");
         } else {
             self.linux_controls.notice = "Restart desktop now: the saved GPU is no longer present".into();
@@ -733,6 +754,7 @@ impl App {
                     // restart cannot be confirmed. Leaving is pointless too
                     // (the saved layout may be stale), so it is abandoned.
                     state.restart_requested = false;
+                    state.restart_since = None;
                     log!("wm: restart desktop cancelled: system controls stopped");
                 }
                 state.notice = if unsaved {
@@ -750,6 +772,7 @@ impl App {
                     state.layout_save_seq = None;
                     if matches!(outcome.result, CommandResult::Failed(_)) && state.restart_requested {
                         state.restart_requested = false;
+                        state.restart_since = None;
                         log!("wm: restart desktop cancelled: the display layout save failed");
                     }
                 }
@@ -758,20 +781,30 @@ impl App {
                     log!("wm: system control {:?} failed: {}", outcome.kind, message);
                 }
             }
-            if state.restart_requested
-                && !state.restart_quit_called
-                && state.layout_save.is_none()
-                && state.layout_save_seq.is_none()
-            {
-                state.restart_quit_called = true;
-                log!("wm: display layout saved; restarting the desktop");
-                cx.quit();
+            if state.restart_requested && !state.restart_quit_called {
+                // A worker thread stays `worker_alive()` (`!is_finished()`)
+                // even wedged (a blocking I/O stall, a stuck command ahead
+                // of ours in its queue), so a dead/missing worker is not
+                // the only way this never resolves: without this bound, a
+                // wedged worker would leave the restart (and the panel's
+                // "Restarting…") waiting forever with no feedback.
+                if state.restart_since.is_some_and(|since| restart_timed_out(since, Cx::monotonic_now())) {
+                    state.restart_requested = false;
+                    state.restart_since = None;
+                    state.notice = "Couldn't save the display layout; the desktop was not restarted".into();
+                    log!("wm: {}", state.notice);
+                } else if state.layout_save.is_none() && state.layout_save_seq.is_none() {
+                    state.restart_quit_called = true;
+                    log!("wm: display layout saved; restarting the desktop");
+                    cx.quit();
+                }
             }
             Some(snapshot)
         } else {
             if state.restart_requested && !state.restart_quit_called {
                 // No controller at all: the same as the worker having died.
                 state.restart_requested = false;
+                state.restart_since = None;
                 log!("wm: restart desktop cancelled: system controls are unavailable");
             }
             None
@@ -915,6 +948,14 @@ impl App {
             };
             if panel.render_on_saved != render_on {
                 panel.render_on_saved = render_on;
+                changed = true;
+            }
+            if panel.restart_waiting != state.restart_requested {
+                // `draw_restart_row` checks `restart_waiting` first, so a
+                // leftover `restart_confirm` from the click that led here
+                // draws nothing: there is no confirm step to show once the
+                // restart is already armed.
+                panel.restart_waiting = state.restart_requested;
                 changed = true;
             }
             if let Some(snapshot) = snapshot {
@@ -1167,6 +1208,16 @@ mod tests {
         // would only fall back to Auto, so the restart is refused.
         assert!(!restart_gate(Some("0000:02:00.0 10de:2b85"), std::slice::from_ref(&gpu)));
         assert!(!restart_gate(Some("0000:01:00.0 10de:2b84"), &[gpu]));
+    }
+
+    #[test]
+    fn restart_times_out_past_the_bound_since_it_was_armed() {
+        assert!(!restart_timed_out(0.0, 0.0));
+        assert!(!restart_timed_out(0.0, RESTART_SAVE_TIMEOUT));
+        assert!(restart_timed_out(0.0, RESTART_SAVE_TIMEOUT + 0.001));
+        // The bound is since the restart was armed, not since the epoch.
+        assert!(!restart_timed_out(100.0, 100.0 + RESTART_SAVE_TIMEOUT - 0.001));
+        assert!(restart_timed_out(100.0, 100.0 + RESTART_SAVE_TIMEOUT + 0.001));
     }
 
     #[test]

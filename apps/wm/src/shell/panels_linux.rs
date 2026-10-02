@@ -1026,11 +1026,22 @@ impl ShellPanel {
     }
 
     /// "Restart desktop now · apps will close", then, once pressed,
-    /// "Cancel" and "Restart": restarting closes every running app.
+    /// "Cancel" and "Restart": restarting closes every running app. Once
+    /// confirmed and waiting for the display layout save to land
+    /// (`restart_waiting`), the row shows "Restarting…" instead, with no
+    /// hit: the confirm has already been sent and there is nothing left
+    /// to press until it either restarts (the process exits) or the App
+    /// abandons it (a save failure or timeout, reported in the notice).
     fn draw_restart_row(&mut self, cx: &mut Cx2d, row: Rect) {
         let tok = self.tokens;
         let fg = tok.popups.text;
         let dim = darker(fg, 1.4);
+        if self.restart_waiting {
+            self.d.icon_centered(cx, Ico::Refresh, rect(row.pos.x, row.pos.y, 22.0, row.size.y), 12.0, dim);
+            self.d.label_elided(cx, rect(row.pos.x + 24.0, row.pos.y, (row.size.x - 28.0).max(0.0), row.size.y),
+                false, tok.font.body_small, dim, HAlign::Left, "Restarting\u{2026}");
+            return;
+        }
         if !self.restart_confirm {
             let hit = Hit::RestartDesktop;
             self.d.cursor_surface(cx, row, &tok.controls, self.hot == Some(hit), false);
@@ -1446,9 +1457,9 @@ impl ShellPanel {
             ));
         }
         text.push_str(&format!(
-            "\nrender_on_saved={:?} render_on_label={:?} render_on_next={:?} render_on_now={:?} render_on_differs={} gpu_env={:?} restart_row={} restart_confirm={}",
+            "\nrender_on_saved={:?} render_on_label={:?} render_on_next={:?} render_on_now={:?} render_on_differs={} gpu_env={:?} restart_row={} restart_confirm={} restart_waiting={}",
             self.render_on_saved, self.render_on_saved_label(), self.render_on_next_label(), self.gpu_label(self.gpu_now()),
-            self.render_on_differs(), s.gpu_env, self.restart_row_shown(), self.restart_confirm
+            self.render_on_differs(), s.gpu_env, self.restart_row_shown(), self.restart_confirm, self.restart_waiting
         ));
         text.push_str(&format!(
             "\ngpu_now={:?} gpu_busy={} gpu_picker={} app_gpu_picker={} gpu_picker_enabled={} gpu_scroll={} gpu_overflow={} gpu_rows={:?} gpu_target_client={:?} gpu_app={:?}",
