@@ -3917,6 +3917,20 @@ impl App {
             WmAction::SwapDir(dir) => {
                 self.state_mut().layout_mut().swap_dir(dir, area, gap);
             }
+            WmAction::MoveToScreen { forward } => {
+                if let Some(focus) = focus {
+                    let (reserved, gaps_out) =
+                        (self.state_mut().style.reserved_height(), self.state_mut().gaps_out);
+                    if self
+                        .state_mut()
+                        .screens
+                        .move_to_screen(focus, forward, gap, reserved, gaps_out)
+                        .is_some()
+                    {
+                        self.focus_client(cx, focus);
+                    }
+                }
+            }
             WmAction::ResizePx { axis, px } => {
                 self.state_mut().layout_mut().resize_px(axis, px, area, gap);
             }
@@ -4534,6 +4548,8 @@ fn test_action(name: &str) -> Option<WmAction> {
         "swap-right" => Some(WmAction::SwapDir(Dir::Right)),
         "swap-up" => Some(WmAction::SwapDir(Dir::Up)),
         "swap-down" => Some(WmAction::SwapDir(Dir::Down)),
+        "move-to-next-screen" => Some(WmAction::MoveToScreen { forward: true }),
+        "move-to-prev-screen" => Some(WmAction::MoveToScreen { forward: false }),
         "grow" => Some(WmAction::ResizePx {
             axis: Axis::Horizontal,
             px: 100.0,

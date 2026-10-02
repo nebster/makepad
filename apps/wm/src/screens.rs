@@ -1070,6 +1070,22 @@ mod tests {
     }
 
     #[test]
+    fn move_to_screen_is_not_reverted_by_the_next_pointer_move_on_the_source_screen() {
+        let mut set = two_screens();
+        // The pointer is sitting on A (screen 0) when the key chord fires.
+        assert_eq!(set.on_pointer(100.0, 100.0), None);
+        assert_eq!(set.active, 0);
+        // Move client 1 (on A) to B with the keyboard: active follows it.
+        assert_eq!(set.move_to_screen(1, true, GAP, RB, GO), Some(1));
+        assert_eq!(set.active, 1);
+        // The mouse hasn't physically moved -- it's still over A. A
+        // MouseMove at the same spot is not a crossing (the pointer never
+        // left A), so it must not undo the keyboard move (task 4's I1 fix).
+        assert_eq!(set.on_pointer(100.0, 100.0), None);
+        assert_eq!(set.active, 1);
+    }
+
+    #[test]
     fn move_to_screen_of_an_unknown_client_is_none() {
         let mut set = two_screens();
         assert_eq!(set.move_to_screen(99, true, GAP, RB, GO), None);
