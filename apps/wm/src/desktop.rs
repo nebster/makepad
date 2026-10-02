@@ -525,7 +525,7 @@ fn mac_icon_box(cell: Rect, hover: f64) -> Rect {
 fn dock_app_ids(state: &WmState) -> Vec<String> {
     let mut apps: Vec<_> = crate::shell::launcher::apps(&state.launchable)
         .into_iter().filter(|app| !app.disabled).map(|app| app.id).collect();
-    for client in state.layout().clients_on(state.layout().active) {
+    for client in state.dock_clients() {
         if let Some(client) = state.clients.get(&client) {
             let id=format!("apps.{}",client.app);
             if !apps.contains(&id) {apps.push(id);}
@@ -589,8 +589,7 @@ impl Widget for DesktopShelf {
                     .filter(|a| !a.disabled)
                     .collect();
                 let clients: Vec<_> = state
-                    .layout()
-                    .clients_on(state.layout().active)
+                    .dock_clients()
                     .into_iter()
                     .filter_map(|c| {
                         state
@@ -706,7 +705,7 @@ impl Widget for DesktopShelf {
                                 ShelfHit::Window(*c),
                                 app_icon(app),
                                 title,
-                                !state.layout().desktop.minimized(*c),
+                                !state.layout_of(*c).desktop.minimized(*c),
                                 style,
                                 opacity,
                             );

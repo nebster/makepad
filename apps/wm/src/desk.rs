@@ -556,6 +556,18 @@ impl WmState {
             .collect()
     }
 
+    /// The windows the dock or taskbar lists: every live screen's shown
+    /// windows (`ScreenSet::shown_clients`), so the one dock on the main
+    /// screen reaches a window on any screen; in a mobile style (one
+    /// layout shown) the active screen's only.
+    pub fn dock_clients(&self) -> Vec<ClientId> {
+        if self.style.target.mobile() {
+            let l = self.layout();
+            return l.clients_on(l.active);
+        }
+        self.screens.shown_clients()
+    }
+
     /// The active screen's layout: where new windows, workspace keys and
     /// the focused window live.
     pub fn layout(&self) -> &WmLayout {

@@ -295,6 +295,17 @@ impl ScreenSet {
         self.screens.get(i).map(|s| s.rect)
     }
 
+    /// The windows every live screen shows (its visible workspace's),
+    /// in screen order, each screen's in `clients_on` order: what the one
+    /// dock or taskbar lists, the same whichever screen is active. One
+    /// screen gives exactly its `clients_on(active)`.
+    pub fn shown_clients(&self) -> Vec<ClientId> {
+        self.screens[..self.live_count()]
+            .iter()
+            .flat_map(|s| s.layout.clients_on(s.layout.active))
+            .collect()
+    }
+
     /// The main screen's rect, where the dock sits; `None` with fewer than
     /// two live screens (the dock spans the whole overlay, as before).
     pub fn main_rect(&self) -> Option<LRect> {
@@ -1427,5 +1438,32 @@ mod tests {
         // A height past the screen's bottom is cut at the margin.
         let card = panel_card_rect(c, right, w, 5000.0, margin, 26.0);
         assert!(inside(right, card), "{card:?}");
+    }
+
+    /// The one dock lists every live screen's shown windows, screen by
+    /// screen, and does not change as the pointer makes another screen
+    /// active; a screen waiting out its removal is not listed.
+    #[test]
+    fn the_dock_lists_every_live_screens_windows_whichever_is_active() {
+        let mut set = two_screens();
+        let one_screen = |s: &ScreenSet, i: usize| {
+            let l = &s.screens[i].layout;
+            l.clients_on(l.active)
+        };
+        let mut want = one_screen(&set, 0);
+        want.extend(one_screen(&set, 1));
+        assert_eq!(sorted(want.clone()), vec![1, 10, 11, 13]);
+        set.active = 0;
+        assert_eq!(set.shown_clients(), want);
+        set.active = 1;
+        assert_eq!(set.shown_clients(), want);
+        // Screen order first: A's window leads.
+        assert_eq!(set.shown_clients()[0], 1);
+        // B pending: only A's.
+        set.reconcile(&[(n("A"), RA)], Some("A"), 10.0, GAP, RB, GO);
+        assert_eq!(set.shown_clients(), vec![1]);
+        // One fallback screen: exactly its own list, as before.
+        let set = fallback_set();
+        assert_eq!(set.shown_clients(), one_screen(&set, 0));
     }
 }
