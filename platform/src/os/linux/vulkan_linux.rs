@@ -64,6 +64,14 @@ pub(super) struct DesktopState {
     /// (see `DirectOutput::outstanding_presents`).
     #[cfg(linux_direct)]
     pub(super) present_wait: Option<ash::khr::present_wait::Device>,
+    /// Other GPUs' screens in the wide desktop, fed slices of the composition.
+    #[cfg(linux_direct)]
+    pub(super) peers: Vec<PeerDisplay>,
+    /// Kept to create peers for cards whose first screen appears later.
+    #[cfg(linux_direct)]
+    pub(super) peer_spawner: Option<ThreadSpawner>,
+    #[cfg(linux_direct)]
+    pub(super) peer_retry_at: Option<Instant>,
 }
 
 /// Cleans up each successfully created parent when a later initialization step
@@ -1086,6 +1094,39 @@ struct CompositionTargets {
 /// The compositor and its apps use `CxVulkan`'s device. Display ownership stays
 /// in a second context, so recreating the renderer never drops the Intel panel.
 #[cfg(linux_direct)]
+/// Another GPU's screens in the wide desktop. Its own direct renderer owns
+/// that card's connectors; after each frame the rendering GPU copies this
+/// card's slice of the composition to it through a GPU bridge, and it shows
+/// the slice on its screens. A busy card skips frames without holding up the
+/// rendering GPU or other cards.
+pub(super) struct PeerDisplay {
+    /// The card node it drives, e.g. `/dev/dri/card0`.
+    card: PathBuf,
+    display: Box<CxVulkan>,
+    bridge: Option<super::gpu_bridge::GpuBridge>,
+    /// This card's slice of the wide desktop; zero-sized while none of its
+    /// screens is placed.
+    slice: crate::linux_wide_desktop::SliceRect,
+    /// The peer's layout generation last folded into the rendering GPU's layout.
+    seen_generation: u64,
+    failure: Option<String>,
+    retry_at: Option<Instant>,
+}
+
+/// A layout the rendering GPU imposes on a peer: the peer's composition size
+/// (its slice) and each of its screens' rectangles inside it.
+#[cfg(linux_direct)]
+#[derive(Clone, Debug, PartialEq)]
+struct ExternalLayout {
+    width: u32,
+    height: u32,
+    rects: Vec<(String, crate::linux_wide_desktop::SliceRect)>,
+}
+
+#[cfg(linux_direct)]
+const PEER_RETRY: Duration = Duration::from_secs(5);
+
+#[cfg(linux_direct)]
 pub(super) struct RoutedCompositor {
     display: Box<CxVulkan>,
     composition: Option<VulkanTextureResource>,
@@ -1306,6 +1347,9 @@ pub(super) struct DirectState {
     preferred_source: Option<String>,
     /// Saved left-to-right order of connector names for the wide desktop.
     preferred_order: Vec<String>,
+    /// Set on a peer: the rendering GPU decides its composition size and its
+    /// screens' rectangles.
+    external_layout: Option<ExternalLayout>,
     /// Bumped (`wrapping_add(1)`) every time `direct_reconcile` gets past its
     /// "nothing to do" early return: hotplug, retries, main-screen and order
     /// requests all set `scan_dirty` first. `screens()` republishes only
@@ -2200,13 +2244,20 @@ impl CxVulkan {
     /// GPU and compose them into one wide desktop, each connector showing
     /// its own slice of it side by side (`linux_wide_desktop`); the main
     /// screen is where the dock and new windows go.
-    pub fn new_direct(mode: Option<&str>, spawner: &ThreadSpawner) -> Result<Self, String> {
+    /// A direct renderer owning the connected connectors `filter` selects on
+    /// one GPU. `export_device` publishes its GPU for hosted apps (false for
+    /// peers, which only present).
+    fn new_direct_presenter(
+        mode: Option<&str>,
+        spawner: &ThreadSpawner,
+        filter: DrmFilter,
+        export_device: bool,
+    ) -> Result<Self, String> {
         let init = DesktopInit::new(&[
             vk::KHR_DISPLAY_NAME,
             vk::EXT_DIRECT_MODE_DISPLAY_NAME,
             vk::EXT_ACQUIRE_DRM_DISPLAY_NAME,
         ])?;
-        let filter = DrmFilter::from_env();
         let connected = scan_drm_connectors(&filter)?;
         if connected.is_empty() {
             return Err(
@@ -2233,6 +2284,7 @@ impl CxVulkan {
                 scan_dirty: false,
                 preferred_source: None,
                 preferred_order: Vec::new(),
+                external_layout: None,
                 layout_generation: 0,
                 pending_source: None,
                 source_name: None,
@@ -2337,7 +2389,10 @@ impl CxVulkan {
                         .push(DirectOutput::inactive(connector, status, RETRY_INITIAL));
                     continue;
                 }
-                let requested = if plans.is_empty() { mode } else { None };
+                let connector_mode = connector_mode_override(&connector.name);
+                let requested = connector_mode
+                    .as_deref()
+                    .or(if plans.is_empty() { mode } else { None });
                 let native_resolution = drm_native_resolution(fd, connector.id);
                 let planned = select_display_mode(
                     &direct.display_loader,
@@ -2435,11 +2490,13 @@ impl CxVulkan {
             let uuid = device_uuid(instance, selected);
             // Hosted children inherit the environment when spawned; they read
             // this before creating their offscreen renderer.
-            std::env::set_var(LINUX_VULKAN_DEVICE_ENV, uuid_hex(&uuid));
-            crate::log!(
-                "Vulkan direct: GPU uuid {} exported as {LINUX_VULKAN_DEVICE_ENV} for hosted apps",
-                uuid_hex(&uuid)
-            );
+            if export_device {
+                std::env::set_var(LINUX_VULKAN_DEVICE_ENV, uuid_hex(&uuid));
+                crate::log!(
+                    "Vulkan direct: GPU uuid {} exported as {LINUX_VULKAN_DEVICE_ENV} for hosted apps",
+                    uuid_hex(&uuid)
+                );
+            }
             let desktop_extent = direct.pending[0].extent;
             (
                 selected,
@@ -2459,6 +2516,17 @@ impl CxVulkan {
             desktop_extent.height,
         )?;
         renderer.direct_initialize(spawner)?;
+        Ok(renderer)
+    }
+
+    pub fn new_direct(mode: Option<&str>, spawner: &ThreadSpawner) -> Result<Self, String> {
+        let mut renderer = Self::new_direct_presenter(mode, spawner, DrmFilter::from_env(), true)?;
+        // A saved left-to-right order until the window manager stores one.
+        if let Ok(text) = std::env::var("MAKEPAD_DISPLAY_ORDER") {
+            if let Some(direct) = renderer.desktop.direct.as_mut() {
+                direct.preferred_order = crate::linux_wide_desktop::parse_display_order(&text);
+            }
+        }
         let compositor = if let Ok(pin) = std::env::var("MAKEPAD_VULKAN_COMPOSITOR_UUID") {
             Some(parse_uuid_hex(&pin).ok_or_else(|| {
                 format!("MAKEPAD_VULKAN_COMPOSITOR_UUID={pin:?} is not 32 hex digits")
@@ -2483,6 +2551,9 @@ impl CxVulkan {
                 return Self::new_routed_compositor(renderer, uuid);
             }
         }
+        // Screens on other GPUs join the wide desktop as peers.
+        renderer.desktop.peer_spawner = Some(spawner.clone());
+        renderer.direct_create_peers();
         Ok(renderer)
     }
 
@@ -3791,6 +3862,7 @@ impl CxVulkan {
             return Ok(None);
         };
         let layout = self.direct_wide_layout(direct);
+        self.direct_assign_peers(&layout);
         let extent = if layout.width > 0 && layout.height > 0 {
             vk::Extent2D { width: layout.width, height: layout.height }
         } else {
@@ -3912,6 +3984,49 @@ impl CxVulkan {
     /// The wide desktop for the active outputs: saved order first, then
     /// connector rank, limited to what this GPU can render and blit.
     fn direct_wide_layout(&self, direct: &DirectState) -> crate::linux_wide_desktop::WideLayout {
+        if let Some(external) = &direct.external_layout {
+            return crate::linux_wide_desktop::WideLayout {
+                screens: external
+                    .rects
+                    .iter()
+                    .map(|(name, rect)| crate::linux_wide_desktop::PlacedScreen {
+                        name: name.clone(),
+                        rect: Some(*rect),
+                    })
+                    .collect(),
+                width: external.width,
+                height: external.height,
+            };
+        }
+        let (mut max_width, mut max_height) = self.direct_size_limits();
+        let mut screens = Self::direct_active_screens(direct);
+        for peer in &self.desktop.peers {
+            let (width, height) = peer.display.direct_size_limits();
+            max_width = max_width.min(width);
+            max_height = max_height.min(height);
+            if let Some(peer_direct) = peer.display.desktop.direct.as_ref() {
+                screens.extend(Self::direct_active_screens(peer_direct));
+            }
+        }
+        crate::linux_wide_desktop::arrange(&screens, &direct.preferred_order, max_width, max_height)
+    }
+
+    /// Active outputs as layout input, in connector-rank order.
+    fn direct_active_screens(direct: &DirectState) -> Vec<crate::linux_wide_desktop::ScreenMode> {
+        let mut active: Vec<&DirectOutput> = direct.outputs.iter().filter(|output| output.active).collect();
+        active.sort_by_key(|output| connector_rank(&output.connector.name));
+        active
+            .iter()
+            .map(|output| crate::linux_wide_desktop::ScreenMode {
+                name: output.connector.name.clone(),
+                width: output.mode_extent.width,
+                height: output.mode_extent.height,
+            })
+            .collect()
+    }
+
+    /// The largest composition this GPU can render into and blit from.
+    fn direct_size_limits(&self) -> (u32, u32) {
         let limits = unsafe { self.instance.get_physical_device_properties(self.physical_device) }.limits;
         let viewport_reach = (-limits.viewport_bounds_range[0]).max(0.0) as u32;
         let max_width = limits
@@ -3923,17 +4038,259 @@ impl CxVulkan {
             .max_image_dimension2_d
             .min(limits.max_framebuffer_height)
             .min(limits.max_viewport_dimensions[1]);
-        let mut active: Vec<&DirectOutput> = direct.outputs.iter().filter(|output| output.active).collect();
-        active.sort_by_key(|output| connector_rank(&output.connector.name));
-        let screens: Vec<crate::linux_wide_desktop::ScreenMode> = active
+        (max_width, max_height)
+    }
+
+    /// Give each peer its slice of `layout` and its screens' rectangles in it.
+    fn direct_assign_peers(&mut self, layout: &crate::linux_wide_desktop::WideLayout) {
+        for peer in &mut self.desktop.peers {
+            let Some(peer_direct) = peer.display.desktop.direct.as_mut() else {
+                continue;
+            };
+            let placed: Vec<(String, crate::linux_wide_desktop::SliceRect)> = peer_direct
+                .outputs
+                .iter()
+                .filter_map(|output| {
+                    layout
+                        .rect_of(&output.connector.name)
+                        .map(|rect| (output.connector.name.clone(), rect))
+                })
+                .collect();
+            let slice = crate::linux_wide_desktop::bounding(placed.iter().map(|(_, rect)| *rect))
+                .unwrap_or_default();
+            let external = ExternalLayout {
+                width: slice.width,
+                height: slice.height,
+                rects: placed
+                    .into_iter()
+                    .map(|(name, rect)| {
+                        let local = crate::linux_wide_desktop::SliceRect {
+                            x: rect.x - slice.x,
+                            y: rect.y - slice.y,
+                            ..rect
+                        };
+                        (name, local)
+                    })
+                    .collect(),
+            };
+            if peer_direct.external_layout.as_ref() != Some(&external) {
+                peer_direct.external_layout = Some(external);
+                peer_direct.scan_dirty = true;
+            }
+            peer.slice = slice;
+        }
+    }
+
+    /// Creates a peer for every other card that has a connected screen this
+    /// renderer cannot drive. Failures are logged and retried later.
+    fn direct_create_peers(&mut self) {
+        let Some(spawner) = self.desktop.peer_spawner.clone() else {
+            return;
+        };
+        if self.desktop.routed.is_some() {
+            return;
+        }
+        let Some(direct) = self.desktop.direct.as_ref() else {
+            return;
+        };
+        let mut cards: Vec<PathBuf> = direct
+            .unsupported
             .iter()
-            .map(|output| crate::linux_wide_desktop::ScreenMode {
-                name: output.connector.name.clone(),
-                width: output.mode_extent.width,
-                height: output.mode_extent.height,
-            })
+            .filter(|(_, status)| status.contains("another GPU"))
+            .map(|(connector, _)| connector.card.clone())
             .collect();
-        crate::linux_wide_desktop::arrange(&screens, &direct.preferred_order, max_width, max_height)
+        cards.sort();
+        cards.dedup();
+        cards.retain(|card| !self.desktop.peers.iter().any(|peer| &peer.card == card));
+        let mut added = false;
+        for card in cards {
+            let name = connector_card_name(&card);
+            let filter = DrmFilter { card: Some(name.clone()), connector: None };
+            match Self::new_direct_presenter(None, &spawner, filter, false) {
+                Ok(display) => {
+                    crate::log!("Vulkan direct: {name} joins the wide desktop; its slice is sent through a GPU bridge");
+                    self.desktop.peers.push(PeerDisplay {
+                        card,
+                        display: Box::new(display),
+                        bridge: None,
+                        slice: Default::default(),
+                        seen_generation: u64::MAX,
+                        failure: None,
+                        retry_at: None,
+                    });
+                    added = true;
+                }
+                Err(error) => crate::warning!("Vulkan direct: {name} cannot join the wide desktop yet: {error}"),
+            }
+        }
+        if added {
+            if let Some(direct) = self.desktop.direct.as_mut() {
+                direct.scan_dirty = true;
+            }
+        }
+    }
+
+    /// Before the rendering GPU's reconcile: peers apply their own hotplug,
+    /// and any change in them makes the rendering GPU lay out again.
+    fn direct_reconcile_peers_before(&mut self) {
+        let now = Instant::now();
+        if self.desktop.peer_retry_at.map_or(true, |at| at <= now) {
+            self.desktop.peer_retry_at = Some(now + PEER_RETRY);
+            self.direct_create_peers();
+        }
+        let mut peers = std::mem::take(&mut self.desktop.peers);
+        let mut changed = false;
+        for peer in &mut peers {
+            if let Err(error) = peer.display.direct_reconcile_outputs() {
+                crate::error!("Vulkan direct: {} reconcile failed: {error}", peer.card.display());
+            }
+            let generation = peer.display.direct_layout_generation();
+            if generation != peer.seen_generation {
+                peer.seen_generation = generation;
+                changed = true;
+            }
+        }
+        self.desktop.peers = peers;
+        if changed {
+            if let Some(direct) = self.desktop.direct.as_mut() {
+                direct.scan_dirty = true;
+            }
+        }
+    }
+
+    /// After the rendering GPU's reconcile: peers take the layout it imposed,
+    /// and their bridges follow their slice size.
+    fn direct_reconcile_peers_after(&mut self) {
+        let mut peers = std::mem::take(&mut self.desktop.peers);
+        for peer in &mut peers {
+            if let Err(error) = peer.display.direct_reconcile_outputs() {
+                crate::error!("Vulkan direct: {} reconcile failed: {error}", peer.card.display());
+            }
+            peer.seen_generation = peer.display.direct_layout_generation();
+            self.direct_ensure_peer_bridge(peer);
+        }
+        self.desktop.peers = peers;
+    }
+
+    /// (Re)creates a peer's bridge once its composition has its slice's size.
+    fn direct_ensure_peer_bridge(&self, peer: &mut PeerDisplay) {
+        let extent = vk::Extent2D { width: peer.slice.width, height: peer.slice.height };
+        let peer_extent = peer.display.desktop.direct.as_ref().map(|direct| direct.desktop_extent);
+        if extent.width == 0 || extent.height == 0 || peer_extent != Some(extent) {
+            return;
+        }
+        if peer.failure.is_none() && peer.bridge.as_ref().is_some_and(|bridge| bridge.extent() == extent) {
+            return;
+        }
+        let now = Instant::now();
+        if peer.retry_at.is_some_and(|at| at > now) {
+            return;
+        }
+        self.device_wait_idle();
+        peer.display.device_wait_idle();
+        if let Some(old) = peer.bridge.take() {
+            unsafe { old.destroy(self, &peer.display) };
+        }
+        match super::gpu_bridge::GpuBridge::new(self, &peer.display, extent) {
+            Ok(bridge) => {
+                crate::log!(
+                    "Vulkan direct: {} receives a {}x{} slice at {},{}",
+                    peer.card.display(),
+                    extent.width,
+                    extent.height,
+                    peer.slice.x,
+                    peer.slice.y
+                );
+                peer.bridge = Some(bridge);
+                peer.failure = None;
+                peer.retry_at = None;
+            }
+            Err(error) => {
+                if peer.failure.as_deref() != Some(error.as_str()) {
+                    crate::error!("Vulkan direct: {} bridge failed: {error}", peer.card.display());
+                }
+                peer.failure = Some(error);
+                peer.retry_at = Some(now + Duration::from_secs(1));
+            }
+        }
+    }
+
+    fn direct_peer_failed(peer: &mut PeerDisplay, error: String) {
+        crate::error!(
+            "Vulkan direct: {} transfer failed ({error}); its screens keep the last frame and retry",
+            peer.card.display()
+        );
+        peer.failure = Some(error);
+        peer.retry_at = Some(Instant::now() + Duration::from_secs(1));
+    }
+
+    /// After a frame: send each peer its slice of `composition` (a busy peer
+    /// skips this frame), then let peers receive and present.
+    fn direct_feed_peers(&mut self, desktop: vk::Extent2D, composition: vk::Image) {
+        let mut peers = std::mem::take(&mut self.desktop.peers);
+        for peer in &mut peers {
+            let slice = peer.slice;
+            let inside = slice.width > 0
+                && slice.height > 0
+                && slice.x + slice.width <= desktop.width
+                && slice.y + slice.height <= desktop.height;
+            let sized = vk::Extent2D { width: slice.width, height: slice.height };
+            if let Some(bridge) = peer.bridge.as_mut() {
+                if inside && peer.failure.is_none() && bridge.extent() == sized {
+                    let offset = vk::Offset2D { x: slice.x as i32, y: slice.y as i32 };
+                    let sent = match unsafe { bridge.writable(self, &peer.display) } {
+                        Ok(true) => unsafe { bridge.send_region(self, composition, offset) },
+                        Ok(false) => Ok(()),
+                        Err(error) => Err(error),
+                    };
+                    if let Err(error) = sent {
+                        Self::direct_peer_failed(peer, error);
+                    }
+                }
+            }
+            self.direct_service_peer(peer);
+        }
+        self.desktop.peers = peers;
+    }
+
+    /// Lets every peer receive a pending slice and present.
+    fn direct_service_peers(&mut self) {
+        let mut peers = std::mem::take(&mut self.desktop.peers);
+        for peer in &mut peers {
+            self.direct_service_peer(peer);
+        }
+        self.desktop.peers = peers;
+    }
+
+    fn direct_service_peer(&self, peer: &mut PeerDisplay) {
+        if peer.failure.is_none() {
+            if let Some(bridge) = peer.bridge.as_mut() {
+                let received = (|| -> Result<bool, String> {
+                    if !unsafe { bridge.poll_initialization(self, &peer.display) }? {
+                        return Ok(false);
+                    }
+                    let Some((image, valid)) = peer.display.desktop.direct.as_ref().and_then(|direct| {
+                        direct.composition.as_ref().map(|composition| (composition.image, direct.composition_valid))
+                    }) else {
+                        return Ok(false);
+                    };
+                    unsafe { bridge.receive(self, &peer.display, image, valid) }
+                })();
+                match received {
+                    Ok(true) => {
+                        if let Some(direct) = peer.display.desktop.direct.as_mut() {
+                            direct.composition_generation += 1;
+                            direct.composition_valid = true;
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(error) => Self::direct_peer_failed(peer, error),
+                }
+            }
+        }
+        if let Err(error) = peer.display.direct_present_retained() {
+            crate::error!("Vulkan direct: {} presentation failed: {error}", peer.card.display());
+        }
     }
 
     /// UI request: lay the screens out left to right in this order of
@@ -4004,11 +4361,13 @@ impl CxVulkan {
         if self.desktop.routed.is_some() {
             return self.routed_reconcile();
         }
+        self.direct_reconcile_peers_before();
         let Some(mut direct) = self.desktop.direct.take() else {
             return Ok(None);
         };
         let result = self.direct_reconcile(&mut direct);
         self.desktop.direct = Some(direct);
+        self.direct_reconcile_peers_after();
         result
     }
 
@@ -4223,11 +4582,12 @@ impl CxVulkan {
             return;
         }
         let native_resolution = drm_native_resolution(fd, connector.id);
+        let connector_mode = connector_mode_override(&connector.name);
         let mode = match select_display_mode(
             &direct.display_loader,
             physical_device,
             display,
-            None,
+            connector_mode.as_deref(),
             native_resolution,
         ) {
             Ok(mode) => mode,
@@ -4579,6 +4939,7 @@ impl CxVulkan {
             direct.wait = DirectWait::GpuBusy;
         }
         self.desktop.direct = Some(direct);
+        self.direct_service_peers();
         result
     }
 
@@ -5058,6 +5419,7 @@ impl CxVulkan {
         direct.wait = DirectWait::Ready;
         before_present();
         self.direct_service_outputs(direct)?;
+        self.direct_feed_peers(direct.desktop_extent, composition);
         Ok(true)
     }
 
@@ -5421,6 +5783,15 @@ impl CxVulkan {
     /// reference to the loaded Vulkan library are deliberately abandoned to
     /// process exit and `false` is returned.
     pub(super) fn destroy_direct_device_resources(&mut self) -> bool {
+        for mut peer in std::mem::take(&mut self.desktop.peers) {
+            self.device_wait_idle();
+            peer.display.device_wait_idle();
+            if let Some(bridge) = peer.bridge.take() {
+                unsafe { bridge.destroy(self, &peer.display) };
+            }
+            // The peer's own Drop releases its displays and device.
+            drop(peer);
+        }
         if let Some(mut routed) = self.desktop.routed.take() {
             routed.display.device_wait_idle();
             if let Some(bridge) = routed.bridge.take() {
@@ -5548,10 +5919,22 @@ impl CxVulkan {
                     status,
                 }
             })
+            .chain(self.desktop.peers.iter().flat_map(|peer| {
+                let slice = peer.slice;
+                peer.display.direct_display_snapshot().outputs.into_iter().map(move |mut output| {
+                    output.primary = false;
+                    output.desktop_position =
+                        output.desktop_position.map(|(x, y)| (slice.x + x, slice.y + y));
+                    output
+                })
+            }))
             .chain(
                 direct
                     .unsupported
                     .iter()
+                    .filter(|(connector, _)| {
+                        !self.desktop.peers.iter().any(|peer| peer.card == connector.card)
+                    })
                     .map(|(connector, status)| LinuxDisplayOutput {
                         name: connector.name.clone(),
                         width: 0,
@@ -5586,6 +5969,18 @@ impl CxVulkan {
 }
 
 #[cfg(linux_direct)]
+/// `MAKEPAD_DRM_MODES` names a display mode per connector, e.g.
+/// `card0-HDMI-A-2=3840x2160@30,card1-DP-1=1920x1080`, for links that cannot
+/// carry a screen's fastest native mode.
+#[cfg(linux_direct)]
+fn connector_mode_override(name: &str) -> Option<String> {
+    let text = std::env::var("MAKEPAD_DRM_MODES").ok()?;
+    crate::linux_wide_desktop::parse_mode_overrides(&text)
+        .into_iter()
+        .find(|(connector, _)| connector == name)
+        .map(|(_, mode)| mode)
+}
+
 fn connector_card_name(card: &Path) -> String {
     card.file_name()
         .map(|name| name.to_string_lossy().into_owned())

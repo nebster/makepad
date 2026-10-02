@@ -409,7 +409,6 @@ impl GpuBridge {
     }
 
     /// The size of the rectangle each send carries.
-    #[allow(dead_code)]
     pub fn extent(&self) -> vk::Extent2D {
         self.extent
     }
