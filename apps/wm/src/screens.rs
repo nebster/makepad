@@ -138,10 +138,17 @@ pub fn screen_at(rects: &[LRect], x: f64, y: f64) -> Option<usize> {
 /// per that screen) removed from its bottom edge, then inset by
 /// `gaps_out` on every side.
 pub fn screen_area(rect: LRect, reserved_bottom: f64, gaps_out: f64) -> LRect {
-    let h = (rect.h - reserved_bottom).max(0.0);
+    screen_area_top(rect, 0.0, reserved_bottom, gaps_out)
+}
+
+/// `screen_area` with `reserved_top` (the bar, where it floats over the
+/// screen) also removed, from the top edge.
+pub fn screen_area_top(rect: LRect, reserved_top: f64, reserved_bottom: f64, gaps_out: f64) -> LRect {
+    let top = reserved_top.min(rect.h).max(0.0);
+    let h = (rect.h - top - reserved_bottom).max(0.0);
     let w = (rect.w - gaps_out * 2.0).max(0.0);
     let h = (h - gaps_out * 2.0).max(0.0);
-    LRect::new(rect.x + gaps_out, rect.y + gaps_out, w, h)
+    LRect::new(rect.x + gaps_out, rect.y + top + gaps_out, w, h)
 }
 
 /// One physical screen and the layout that tiles it.
@@ -203,6 +210,10 @@ pub struct ScreenSet {
     pointer: Option<usize>,
     /// Clients drawn across one or more screens (see `Span`).
     spans: Vec<Span>,
+    /// The bar's height while it floats over the top of every screen (a
+    /// multi-screen desktop), else 0: the bar then sits in a strip above
+    /// the desk and takes nothing from it. See `reserved_top_for`.
+    pub bar_top: f64,
 }
 
 fn contains_rect(outer: LRect, inner: LRect) -> bool {
@@ -254,6 +265,7 @@ impl ScreenSet {
             pending_removal: Vec::new(),
             pointer: None,
             spans: Vec::new(),
+            bar_top: 0.0,
         }
     }
 
@@ -317,7 +329,8 @@ impl ScreenSet {
             return None;
         }
         let i = if i < live { i } else { self.active };
-        self.screens.get(i).map(|s| s.rect)
+        // Below the screen's bar segment, as on one screen.
+        self.screens.get(i).map(|s| screen_area_top(s.rect, self.reserved_top_for(i), 0.0, 0.0))
     }
 
     /// The windows every live screen shows (its visible workspace's),
@@ -350,11 +363,27 @@ impl ScreenSet {
         }
     }
 
-    /// Screen `i`'s tiling area (`screen_area` with the dock reserved only
-    /// on the main screen), never narrower or shorter than one point, like
-    /// the WM's single-desk area.
+    /// The bar's reservation on screen `i`: `bar_top` (the bar floats over
+    /// the top of every screen), except on a screen a shown span covers,
+    /// whose bar segment is hidden under the span's window.
+    pub fn reserved_top_for(&self, i: usize) -> f64 {
+        if self.spanned(i).is_some() {
+            0.0
+        } else {
+            self.bar_top
+        }
+    }
+
+    /// Screen `i`'s tiling area (`screen_area` with the bar reserved per
+    /// `reserved_top_for` and the dock only on the main screen), never
+    /// narrower or shorter than one point, like the WM's single-desk area.
     pub fn area(&self, i: usize, reserved_bottom: f64, gaps_out: f64) -> LRect {
-        let a = screen_area(self.screens[i].rect, self.reserved_for(i, reserved_bottom), gaps_out);
+        let a = screen_area_top(
+            self.screens[i].rect,
+            self.reserved_top_for(i),
+            self.reserved_for(i, reserved_bottom),
+            gaps_out,
+        );
         LRect::new(a.x, a.y, a.w.max(1.0), a.h.max(1.0))
     }
 
@@ -448,9 +477,10 @@ impl ScreenSet {
         if self.live_count() >= 2 && !range.contains(&home) {
             let to = range.start;
             let rb = self.reserved_for(to, reserved_bottom);
+            let top = self.bar_top;
             let (s, d) = two_mut(&mut self.screens, home, to);
             let offset = (d.rect.x - s.rect.x, d.rect.y - s.rect.y);
-            let area = screen_area(d.rect, rb, gaps_out);
+            let area = screen_area_top(d.rect, top, rb, gaps_out);
             if !transfer_client(&mut s.layout, &mut d.layout, c, offset, area, gap) {
                 return Err(SpanError::Empty);
             }
@@ -475,7 +505,7 @@ impl ScreenSet {
                 self.drop_fullscreen(other);
             }
         }
-        let area = screen_area(self.screens[home].rect, self.reserved_for(home, reserved_bottom), gaps_out);
+        let area = screen_area_top(self.screens[home].rect, self.bar_top, self.reserved_for(home, reserved_bottom), gaps_out);
         let layout = &mut self.screens[home].layout;
         if layout.is_float(c) && !layout.desktop.enabled {
             layout.toggle_float(c, area, gap);
@@ -652,7 +682,7 @@ impl ScreenSet {
 
     /// A kept screen got `rect`: shift its floats by the move, keep them
     /// reachable, and hand the layout its new outer rect.
-    fn set_rect(s: &mut ScreenLayout, rect: LRect, reserved_bottom: f64, gaps_out: f64) {
+    fn set_rect(s: &mut ScreenLayout, rect: LRect, reserved_top: f64, reserved_bottom: f64, gaps_out: f64) {
         if s.rect != rect {
             // A screen that grew into, or shrank to part of, its old rect
             // (the "" desk renamed to a screen, a screen merged into the
@@ -664,7 +694,7 @@ impl ScreenSet {
                 (rect.x - s.rect.x, rect.y - s.rect.y)
             };
             s.layout.translate(dx, dy);
-            s.layout.fit_floats(screen_area(rect, reserved_bottom, gaps_out));
+            s.layout.fit_floats(screen_area_top(rect, reserved_top, reserved_bottom, gaps_out));
         }
         s.layout.set_outer(rect);
         s.rect = rect;
@@ -677,8 +707,9 @@ impl ScreenSet {
     fn migrate_all(&mut self, src: usize, dst: usize, gap: f64, reserved_bottom: f64, gaps_out: f64) {
         let src_name = self.screens[src].name.clone();
         let rb = self.reserved_for(dst, reserved_bottom);
+        let top = self.bar_top;
         let (s, d) = two_mut(&mut self.screens, src, dst);
-        let area = screen_area(d.rect, rb, gaps_out);
+        let area = screen_area_top(d.rect, top, rb, gaps_out);
         for ws in 0..=SCRATCHPAD {
             let taken = s.layout.take_workspace_clients(ws);
             if taken.is_empty() {
@@ -703,6 +734,7 @@ impl ScreenSet {
     fn return_home(&mut self, dst: usize, gap: f64, reserved_bottom: f64, gaps_out: f64) {
         let name = self.screens[dst].name.clone();
         let rb = self.reserved_for(dst, reserved_bottom);
+        let top = self.bar_top;
         let mut back: Vec<ClientId> =
             self.homes.iter().filter(|(_, h)| **h == name).map(|(c, _)| *c).collect();
         back.sort();
@@ -714,7 +746,7 @@ impl ScreenSet {
             }
             let (s, d) = two_mut(&mut self.screens, src, dst);
             let Some(t) = s.layout.detach(c) else { continue };
-            let area = screen_area(d.rect, rb, gaps_out);
+            let area = screen_area_top(d.rect, top, rb, gaps_out);
             place(s.rect, d, t.ws, t, area, gap);
         }
     }
@@ -795,7 +827,7 @@ impl ScreenSet {
                 .unwrap_or_else(|| self.main.min(self.screens.len() - 1));
             // The survivor is the one desk, so the dock is on it.
             self.main = keep;
-            Self::set_rect(&mut self.screens[keep], new[0].1, reserved_bottom, gaps_out);
+            Self::set_rect(&mut self.screens[keep], new[0].1, self.bar_top, reserved_bottom, gaps_out);
             for i in (0..self.screens.len()).rev() {
                 if i != keep {
                     self.migrate_all(i, keep, gap, reserved_bottom, gaps_out);
@@ -824,7 +856,7 @@ impl ScreenSet {
             if let Some(i) = old.iter().position(|s| &s.name == name) {
                 let mut s = old.remove(i);
                 let rb = if *name == main_screen { reserved_bottom } else { 0.0 };
-                Self::set_rect(&mut s, *rect, rb, gaps_out);
+                Self::set_rect(&mut s, *rect, self.bar_top, rb, gaps_out);
                 self.screens.push(s);
             } else {
                 let mut layout = WmLayout::new();
@@ -941,8 +973,9 @@ impl ScreenSet {
         }
         self.clear_span(c);
         let rb = self.reserved_for(to, reserved_bottom);
+        let top = self.bar_top;
         let (s, d) = two_mut(&mut self.screens, from, to);
-        let area = screen_area(d.rect, rb, gaps_out);
+        let area = screen_area_top(d.rect, top, rb, gaps_out);
         if !transfer_client(&mut s.layout, &mut d.layout, c, (0.0, 0.0), area, gap) {
             return false;
         }
@@ -977,9 +1010,10 @@ impl ScreenSet {
         // A spanned window leaves its span (and fullscreen) to move.
         self.clear_span(c);
         let rb = self.reserved_for(to, reserved_bottom);
+        let top = self.bar_top;
         let (s, d) = two_mut(&mut self.screens, from, to);
         let offset = (d.rect.x - s.rect.x, d.rect.y - s.rect.y);
-        let area = screen_area(d.rect, rb, gaps_out);
+        let area = screen_area_top(d.rect, top, rb, gaps_out);
         if !transfer_client(&mut s.layout, &mut d.layout, c, offset, area, gap) {
             return None;
         }
@@ -2284,5 +2318,73 @@ mod tests {
         assert_eq!((set.span_home(1), set.span_home(2)), (Some(0), None));
         set.screens[0].layout.switch_workspace(3);
         assert_eq!(set.span_at(2500.0, 100.0), None);
+    }
+
+    // --- the bar over the screens -------------------------------------
+
+    #[test]
+    fn screen_area_top_reserves_the_bar_above_the_gaps() {
+        let rect = LRect::new(0.0, 0.0, 1920.0, 1080.0);
+        // No bar reservation is exactly `screen_area`.
+        assert_eq!(screen_area_top(rect, 0.0, 60.0, 10.0), screen_area(rect, 60.0, 10.0));
+        // The bar comes off the top, the dock off the bottom, then the gaps.
+        assert_eq!(
+            screen_area_top(rect, 26.0, 60.0, 10.0),
+            LRect::new(10.0, 36.0, 1900.0, 1080.0 - 26.0 - 60.0 - 20.0)
+        );
+        // A screen shorter than the bar keeps a zero-height area.
+        assert_eq!(screen_area_top(LRect::new(0.0, 0.0, 100.0, 20.0), 26.0, 0.0, 0.0).h, 0.0);
+    }
+
+    /// One screen: the bar is a strip above the desk, which already
+    /// starts below it, so nothing is reserved and the area is today's
+    /// (`bar_top` stays 0 off the multi-screen desktop).
+    #[test]
+    fn one_screen_reserves_no_bar_and_keeps_todays_area() {
+        let desk = LRect::new(0.0, 26.0, 1400.0, 874.0);
+        let set = ScreenSet::new(WmLayout::new(), desk);
+        assert_eq!(set.bar_top, 0.0);
+        assert_eq!(set.reserved_top_for(0), 0.0);
+        assert_eq!(set.area(0, 60.0, 10.0), screen_area(desk, 60.0, 10.0));
+        assert_eq!(set.area(0, 60.0, 10.0), LRect::new(10.0, 36.0, 1380.0, 874.0 - 60.0 - 20.0));
+        assert_eq!(set.surface_rect(0), None);
+    }
+
+    #[test]
+    fn every_screen_reserves_the_floating_bar() {
+        let mut set = two_screens();
+        set.bar_top = 26.0;
+        assert_eq!((set.reserved_top_for(0), set.reserved_top_for(1)), (26.0, 26.0));
+        // The dock stays on the main screen (A) only.
+        assert_eq!(set.area(0, 60.0, 10.0), screen_area_top(RA, 26.0, 60.0, 10.0));
+        assert_eq!(set.area(1, 60.0, 10.0), screen_area_top(RB_, 26.0, 0.0, 10.0));
+        // Shell surfaces open below the screen's bar segment.
+        assert_eq!(set.surface_rect(1), Some(LRect::new(1920.0, 26.0, 1920.0, 1054.0)));
+        // The bar hidden (ToggleBar): nothing reserved.
+        set.bar_top = 0.0;
+        assert_eq!(set.area(1, 60.0, 10.0), screen_area(RB_, 0.0, 10.0));
+        assert_eq!(set.surface_rect(1), Some(RB_));
+    }
+
+    #[test]
+    fn a_spanned_screen_reserves_no_bar() {
+        let mut set = three_screens();
+        set.bar_top = 26.0;
+        set.set_span(10, &ScreenSpan::Screens(names(&["A", "B"])), GAP, RB, GO).unwrap();
+        assert_eq!(
+            (set.reserved_top_for(0), set.reserved_top_for(1), set.reserved_top_for(2)),
+            (0.0, 0.0, 26.0)
+        );
+        assert_eq!(set.area(0, 0.0, 0.0), RA);
+        assert_eq!(set.area(2, 0.0, 0.0), screen_area_top(RC, 26.0, 0.0, 0.0));
+        assert_eq!(set.surface_rect(1), Some(RB_));
+        // The span still covers its screens' whole rects.
+        assert_eq!(set.span_rects(), vec![(10, LRect::new(0.0, 0.0, 3840.0, 1080.0))]);
+        // Its workspace switched away: B's own layout and bar are back.
+        set.screens[1].layout.switch_workspace(3);
+        assert_eq!((set.reserved_top_for(0), set.reserved_top_for(1)), (26.0, 26.0));
+        set.screens[1].layout.switch_workspace(0);
+        assert!(set.clear_span(10));
+        assert_eq!(set.reserved_top_for(0), 26.0);
     }
 }
