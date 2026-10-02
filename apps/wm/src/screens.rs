@@ -405,15 +405,32 @@ impl ScreenSet {
     }
 
     /// The screens `c` currently covers fullscreen, by protocol name: its
-    /// span's screens, or, on a single screen, that screen while it holds
+    /// span's screens while the span is SHOWN; while `c` instead holds a
+    /// plain `Fullscreen` on its home (the span hidden by an overlap, or
+    /// by one of its other screens pending removal), just the home screen,
+    /// matching what is actually drawn; while `c`'s workspace is switched
+    /// away (nothing drawn at all), the span's names, so a client told
+    /// about a span it is not currently showing still knows what it is
+    /// (Hyprland-style). On a single screen: that screen while `c` holds
     /// a true `Fullscreen` on its workspace (a `Maximized` one keeps the
     /// bar, so spans nothing).
     pub fn fullscreen_span_of(&self, c: ClientId) -> Option<Vec<String>> {
-        let (i, _) = self.holds_fullscreen(c)?;
-        if let Some(span) = self.spans.iter().find(|s| s.client == c) {
+        let (i, ws) = self.fullscreen_at(c)?;
+        if let Some((k, span)) = self.spans.iter().enumerate().find(|(_, s)| s.client == c) {
+            if self.shown(k) {
+                return Some(span.names.clone());
+            }
+            let layout = &self.screens[i].layout;
+            if i < self.live_count()
+                && ws == layout.active
+                && !layout.scratchpad_open
+                && !layout.desktop.minimized(c)
+            {
+                return self.live_wm_screens().get(i).map(|s| vec![s.name.clone()]);
+            }
             return Some(span.names.clone());
         }
-        if self.live_count() >= 2 {
+        if i >= self.live_count() || self.live_count() >= 2 {
             return None;
         }
         self.live_wm_screens().get(i).map(|s| vec![s.name.clone()])
@@ -2150,6 +2167,9 @@ mod tests {
         assert!(holds(&set, 10));
         assert_eq!(set.spanned(0), None);
         assert!(set.span_rects().is_empty());
+        // Drawn as B's plain Fullscreen while A is pending: report B only,
+        // not the hidden [A, B] span.
+        assert_eq!(set.fullscreen_span_of(10), Some(names(&["B"])));
         // The removal expires: dropped, 10 is a normal tile of B again.
         set.reconcile(&[(n("B"), RB_), (n("C"), RC)], Some("B"), 1.0 + REMOVAL_DEBOUNCE, GAP, RB, GO);
         assert_eq!(set.span_of(10), None);
@@ -2300,6 +2320,9 @@ mod tests {
         set.screens[0].layout.switch_workspace(2);
         assert_eq!((set.spanned(0), set.spanned(1)), (None, Some(10)));
         assert_eq!(set.span_rects(), vec![(10, RB_)]);
+        // 5 is drawn as A's plain Fullscreen, not its hidden [A, B] span:
+        // report A only, matching the framebuffer.
+        assert_eq!(set.fullscreen_span_of(5), Some(names(&["A"])));
         // The newer span ends: 5 spans both screens again.
         set.clear_span(10);
         assert_eq!((set.spanned(0), set.spanned(1)), (Some(5), Some(5)));

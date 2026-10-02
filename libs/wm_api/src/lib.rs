@@ -9,11 +9,11 @@
 //!
 //! Standalone (not hosted) the requests fall back: a preview/open spawns
 //! the associated app as its own window, title/cwd are no-ops.
-//! [`screens`]/[`set_fullscreen_span`] fall back too -- on Linux (direct
-//! or windowed; only the direct backend actually ever reports screens,
-//! so a span only ever resolves there) a span is resolved against
-//! [`screens`] and recorded in-process, no WM involved; see
-//! [`span_rect_for_window`] for the rect an app lays its content into.
+//! [`screens`]/[`set_fullscreen_span`] fall back too -- on Linux, not
+//! OHOS (direct or windowed; only the direct backend actually ever
+//! reports screens, so a span only ever resolves there) a span is
+//! resolved against [`screens`] and recorded in-process, no WM involved;
+//! see [`span_rect_for_window`] for the rect an app lays its content into.
 //!
 //! ```ignore
 //! // files, on Space:
@@ -93,9 +93,13 @@ pub enum WmEvent {
     /// The live screens, left to right, in THIS window's coordinates (a
     /// screen's rect minus the window's own origin), and the names of the
     /// screens this window currently spans fullscreen (`None` when it
-    /// spans none). Sent when the window is first shown or adopted, and
-    /// again whenever the screens or the window's position change; read
-    /// it back with [`screens`].
+    /// spans none). The rects are desk-clipped, like the window's own
+    /// framebuffer (e.g. narrower while the AI pane reserves part of the
+    /// desk), not the physical screens. Sent when the window is first
+    /// shown or adopted, and again whenever the screens or the window's
+    /// position change, in no guaranteed order relative to a concurrent
+    /// `WindowGeomChange`/swapchain resize -- lay out from whichever
+    /// arrives last. Read it back with [`screens`].
     Screens {
         screens: Vec<WmScreen>,
         span: Option<Vec<String>>,
@@ -189,11 +193,10 @@ pub fn screens(cx: &Cx) -> Vec<WmScreen> {
 /// The names of the screens this window currently spans fullscreen, left
 /// to right, or `None` when it spans none. Hosted: the last
 /// [`WmEvent::Screens`]'s `span`. Standalone: the span last recorded by
-/// [`set_fullscreen_span`] (on Linux; the cfg gate it shares with
-/// `screens`/`platform::screens()` below), re-resolved against the live
-/// screens (dropped, like the WM drops it, if a name no longer resolves
-/// -- e.g. after a hotplug); `None` on every other standalone backend,
-/// matching that function's fallback there.
+/// [`set_fullscreen_span`] (Linux, not OHOS, only), re-resolved against
+/// the live screens (dropped, like the WM drops it, if a name no longer
+/// resolves -- e.g. after a hotplug); `None` on every other standalone
+/// backend, matching that function's fallback there.
 pub fn current_span(cx: &Cx) -> Option<Vec<String>> {
     if hosted(cx) {
         return LAST_SCREENS
@@ -243,18 +246,22 @@ pub fn standalone_screens(
 }
 
 /// Ask the WM to make this window fullscreen across `span` (`None` =
-/// leave fullscreen); the outcome arrives as a [`WmEvent::Screens`] and is
-/// read back with [`current_span`].
+/// leave fullscreen). Hosted, this is asynchronous: a `true` return means
+/// only that the request was sent, not that it was honoured -- the
+/// outcome arrives later as a [`WmEvent::Screens`] and is read back with
+/// [`current_span`]; under Studio's run view (hosted, but no WM to
+/// answer) it still returns `true` though no [`WmEvent::Screens`] ever
+/// follows.
 ///
-/// Standalone on Linux (direct or windowed; same cfg gate as `screens`/
-/// `platform::screens()` -- there is no WM to answer, and on the direct
-/// backend its one window already covers the whole wide desktop):
-/// resolves `span` against the live screens and records it directly,
-/// same-process -- [`span_rect_for_window`] then gives the union rect to
-/// lay content into; no composition change. Returns false (and the
-/// recorded span is cleared) when `span` does not resolve (unknown name,
-/// not adjacent, or -- `Current` with no primary/first screen -- no live
-/// screens; windowed Linux never has any, so it always lands here).
+/// Standalone on Linux, not OHOS (direct or windowed; there is no WM to
+/// answer, and on the direct backend its one window already covers the
+/// whole wide desktop): resolves `span` against the live screens and
+/// records it directly, same-process -- [`span_rect_for_window`] then
+/// gives the union rect to lay content into; no composition change.
+/// Returns false (and the recorded span is cleared) when `span` does not
+/// resolve (unknown name, not adjacent, or -- `Current` with no
+/// primary/first screen -- no live screens; windowed Linux never has any,
+/// so it always lands here).
 ///
 /// Standalone on every other backend (macOS, Windows, wasm,
 /// android/ohos): not yet implemented; returns false (nothing recorded,
@@ -268,10 +275,10 @@ pub fn set_fullscreen_span(cx: &Cx, span: Option<ScreenSpan>) -> bool {
 
 /// The span recorded by [`set_fullscreen_span`] for a standalone Linux
 /// direct app: there is no WM to hold it, so this process does.
-#[cfg(all(not(gpusim), target_os = "linux", not(target_env = "ohos")))]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 static STANDALONE_SPAN: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
 
-#[cfg(all(not(gpusim), target_os = "linux", not(target_env = "ohos")))]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 fn standalone_set_fullscreen_span(span: Option<ScreenSpan>) -> bool {
     let screens = standalone_screens(
         &makepad_widgets_core::makepad_platform::screens(),
@@ -286,7 +293,7 @@ fn standalone_set_fullscreen_span(span: Option<ScreenSpan>) -> bool {
     ok
 }
 
-#[cfg(all(not(gpusim), target_os = "linux", not(target_env = "ohos")))]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 fn standalone_current_span() -> Option<Vec<String>> {
     let recorded = STANDALONE_SPAN.lock().unwrap_or_else(|p| p.into_inner()).clone();
     let screens = standalone_screens(
@@ -296,12 +303,12 @@ fn standalone_current_span() -> Option<Vec<String>> {
     resolve_standalone_current_span(&screens, &recorded)
 }
 
-#[cfg(not(all(not(gpusim), target_os = "linux", not(target_env = "ohos"))))]
+#[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
 fn standalone_set_fullscreen_span(_span: Option<ScreenSpan>) -> bool {
     false
 }
 
-#[cfg(not(all(not(gpusim), target_os = "linux", not(target_env = "ohos"))))]
+#[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
 fn standalone_current_span() -> Option<Vec<String>> {
     None
 }
