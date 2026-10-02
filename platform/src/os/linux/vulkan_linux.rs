@@ -771,7 +771,8 @@ impl CxVulkan {
     }
 
     /// The main render target size. In direct mode this is the composition:
-    /// the render source output's native mode.
+    /// the whole wide desktop (every active output side by side; each shows
+    /// its own slice of it, unscaled).
     pub fn size(&self) -> (u32, u32) {
         (self.swapchain_extent.width, self.swapchain_extent.height)
     }
@@ -2196,7 +2197,9 @@ fn hotplug_worker(
 #[cfg(linux_direct)]
 impl CxVulkan {
     /// Direct-to-display renderer: acquire every connected connector of one
-    /// GPU, render at the source output's native mode and clone it elsewhere.
+    /// GPU and compose them into one wide desktop, each connector showing
+    /// its own slice of it side by side (`linux_wide_desktop`); the main
+    /// screen is where the dock and new windows go.
     pub fn new_direct(mode: Option<&str>, spawner: &ThreadSpawner) -> Result<Self, String> {
         let init = DesktopInit::new(&[
             vk::KHR_DISPLAY_NAME,
@@ -3532,10 +3535,15 @@ impl CxVulkan {
         let display = std::mem::take(&mut output.display);
         let interval = output.retry_interval;
         output.status = status;
+        output.desktop_rect = None;
         output.reacquire = false;
         output.retry_at = Some(Instant::now() + interval);
         output.retry_interval = (interval * 2).min(RETRY_MAX);
         direct.release_surface_and_display(surface, display);
+        // Bumped here too (not only in `direct_select_source`): the output
+        // leaving the desktop must be published even if the next
+        // `direct_select_source` early-returns before touching the layout.
+        direct.layout_generation = direct.layout_generation.wrapping_add(1);
         // The source may have gone; the next reconcile picks a fallback and
         // reports the geometry change.
         direct.scan_dirty = true;
@@ -3745,12 +3753,12 @@ impl CxVulkan {
         self.destroy_uncached_texture_resource(targets.resource);
     }
 
-    /// Choose the render source and, when its mode differs from the desktop,
-    /// replace the composition transactionally. Nothing observable (primary
-    /// flags, source name, the pending request) changes unless the swap
-    /// succeeded, except when no source is active at all: then the fallback
-    /// output is published so rendering continues at the old desktop size
-    /// while the swap is retried (bounded).
+    /// Choose the main screen and, when the wide desktop's size differs from
+    /// the composition, replace it transactionally. Nothing observable
+    /// (primary flags, source name, the pending request) changes unless the
+    /// swap succeeded, except when no source is active at all: then the
+    /// fallback output is published so rendering continues at the old
+    /// desktop size while the swap is retried (bounded).
     /// Returns the new desktop extent when it changed.
     fn direct_select_source(
         &mut self,
@@ -5507,7 +5515,7 @@ impl CxVulkan {
 
     /// The UI's view of the outputs. Only observed state: `active` means a
     /// present on the current swapchain succeeded (`ready` before that);
-    /// `primary` marks the applied render source.
+    /// `primary` marks the main screen.
     pub(crate) fn direct_display_snapshot(&self) -> LinuxDisplaySnapshot {
         if let Some(routed) = &self.desktop.routed {
             return routed.display.direct_display_snapshot();
@@ -5515,18 +5523,30 @@ impl CxVulkan {
         let Some(direct) = self.desktop.direct.as_ref() else {
             return LinuxDisplaySnapshot::default();
         };
+        let desktop_non_empty = direct.desktop_extent.width > 0 && direct.desktop_extent.height > 0;
         let mut outputs: Vec<LinuxDisplayOutput> = direct
             .outputs
             .iter()
-            .map(|output| LinuxDisplayOutput {
-                name: output.connector.name.clone(),
-                width: output.mode_extent.width,
-                height: output.mode_extent.height,
-                refresh_hz: output.refresh_hz(),
-                primary: output.primary,
-                desktop_position: output.desktop_rect.map(|rect| (rect.x, rect.y)),
-                active: output.active && output.presented_ok,
-                status: output.status.clone(),
+            .map(|output| {
+                let active = output.active && output.presented_ok;
+                // Left out by the layout (it would exceed the GPU's limits),
+                // not merely not yet laid out: say so instead of `active`'s
+                // generic status.
+                let status = if active && output.desktop_rect.is_none() && desktop_non_empty {
+                    "active: not in the wide desktop (exceeds GPU limits)".to_string()
+                } else {
+                    output.status.clone()
+                };
+                LinuxDisplayOutput {
+                    name: output.connector.name.clone(),
+                    width: output.mode_extent.width,
+                    height: output.mode_extent.height,
+                    refresh_hz: output.refresh_hz(),
+                    primary: output.primary,
+                    desktop_position: output.desktop_rect.map(|rect| (rect.x, rect.y)),
+                    active,
+                    status,
+                }
             })
             .chain(
                 direct

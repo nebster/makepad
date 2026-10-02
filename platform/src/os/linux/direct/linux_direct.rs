@@ -52,7 +52,7 @@ pub struct DirectApp {
     /// The (layout generation, DPI factor bits) last published to
     /// `screens()`; `direct_publish_screens` skips its work when neither
     /// moved.
-    #[cfg(use_vulkan)]
+    #[cfg(all(not(gpusim), use_vulkan, target_os = "linux", not(target_env = "ohos")))]
     published_screens: Option<(u64, u64)>,
     // Dropped after the display/input resources on normal event-loop exit.
     _terminal: Option<DirectTerminal>,
@@ -107,7 +107,7 @@ impl DirectApp {
             cursor: Default::default(),
             #[cfg(use_vulkan)]
             first_frame_submitted: false,
-            #[cfg(use_vulkan)]
+            #[cfg(all(not(gpusim), use_vulkan, target_os = "linux", not(target_env = "ohos")))]
             published_screens: None,
             width,
             height,
@@ -405,13 +405,13 @@ impl Cx {
         let reconciled = vulkan.direct_reconcile_outputs();
         let presented = vulkan.direct_present_retained();
         self.os.vulkan = Some(vulkan);
+        #[cfg(all(not(gpusim), use_vulkan, target_os = "linux", not(target_env = "ohos")))]
+        self.direct_publish_screens(direct_app);
         match reconciled {
             Ok(Some(extent)) => self.direct_apply_desktop_extent(direct_app, extent.width, extent.height),
             Ok(None) => {}
             Err(error) => crate::error!("Direct Vulkan: display reconcile failed: {error}"),
         }
-        #[cfg(all(not(gpusim), use_vulkan, target_os = "linux", not(target_env = "ohos")))]
-        self.direct_publish_screens(direct_app);
         if let Err(error) = presented {
             crate::error!("Direct Vulkan: output presentation failed: {error}");
         }
@@ -444,7 +444,7 @@ impl Cx {
             return;
         }
         let snapshot = self.linux_display_snapshot();
-        let screens = snapshot
+        let mut screens: Vec<crate::screen::ScreenGeom> = snapshot
             .outputs
             .iter()
             .filter_map(|output| {
@@ -456,11 +456,13 @@ impl Cx {
                 Some(crate::screen::ScreenGeom { bounds, work_area: bounds, is_primary: output.primary })
             })
             .collect();
+        // Desktop order: left to right by position.
+        screens.sort_by(|a, b| a.bounds.pos.x.partial_cmp(&b.bounds.pos.x).unwrap_or(std::cmp::Ordering::Equal));
         crate::screen::set_linux_screens(screens);
         direct_app.published_screens = Some(key);
     }
 
-    /// The render source changed its native size: the logical desktop is that
+    /// The wide desktop changed size: the logical desktop is that
     /// size divided by the effective DPI. The main window gets the ordinary
     /// geometry event (children relayout from it), raw input keeps its native
     /// base DPI so the existing override remap stays correct.

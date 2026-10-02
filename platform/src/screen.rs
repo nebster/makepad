@@ -43,11 +43,16 @@ pub fn screens() -> Vec<ScreenGeom> {
 /// The screens the Linux direct backend arranged into its wide desktop, in
 /// window coordinates (native pixels divided by the window's DPI factor).
 /// Empty for other Linux backends.
+///
+/// `screens()` below is a free function without a `Cx`, so the direct
+/// backend publishes into this static; a future X11 implementation must
+/// publish here too or split the cfg.
 #[cfg(all(not(gpusim), target_os = "linux", not(target_env = "ohos")))]
 static LINUX_SCREENS: std::sync::Mutex<Vec<ScreenGeom>> = std::sync::Mutex::new(Vec::new());
 
 /// Every display attached right now, in the platform's window-position space:
-/// on Linux, the direct backend's wide desktop (empty for other backends).
+/// on Linux, the direct backend's wide desktop, ordered left to right by
+/// position (empty for other backends).
 #[cfg(all(not(gpusim), target_os = "linux", not(target_env = "ohos")))]
 pub fn screens() -> Vec<ScreenGeom> {
     LINUX_SCREENS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
