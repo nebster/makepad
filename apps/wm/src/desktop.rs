@@ -27,10 +27,10 @@ pub struct StyleTween {
 impl Default for StyleTween {
     fn default() -> Self {
         Self {
-            target: DesktopStyle::Macos,
+            target: DesktopStyle::Omarchy,
             dark: false,
-            weights: one_hot(DesktopStyle::Macos as usize),
-            q: QuickTo::at(one_hot(DesktopStyle::Macos as usize)),
+            weights: one_hot(DesktopStyle::Omarchy as usize),
+            q: QuickTo::at(one_hot(DesktopStyle::Omarchy as usize)),
         }
     }
 }
@@ -92,9 +92,15 @@ impl StyleTween {
 mod tests {
     use super::*;
     #[test]
+    fn the_desktop_starts_in_the_hyprland_style() {
+        let t = StyleTween::default();
+        assert_eq!(t.target, DesktopStyle::Omarchy);
+        assert_eq!(t.weights, one_hot(DesktopStyle::Omarchy as usize));
+    }
+    #[test]
     fn interrupted_switch_starts_from_the_visible_mix_and_lands_exactly() {
         let mut t = StyleTween::default();
-        t.select(DesktopStyle::Omarchy);
+        t.select(DesktopStyle::Macos);
         t.step(0.2);
         let old = t.weights;
         t.select(DesktopStyle::Windows2000);
