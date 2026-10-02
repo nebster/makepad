@@ -537,19 +537,11 @@ impl WmState {
         );
         // A screen that just appeared has a fresh layout: give it the
         // style's presentation (desktop-style windows or tiles).
+        // (A true Fullscreen from the single desk became a span of its
+        // screen inside `reconcile`, see `ScreenSet::normalize_spans`.)
         let floating = self.style.target.floating();
-        let several = self.screens.live_count() >= 2;
         for s in &mut self.screens.screens {
             s.layout.desktop.enabled = floating;
-            // Several screens share the bar strip: a true Fullscreen from
-            // the single desk becomes Maximized (see do_action).
-            if several {
-                for w in &mut s.layout.workspaces {
-                    if w.fullscreen_mode == crate::layout::FullscreenMode::Fullscreen {
-                        w.fullscreen_mode = crate::layout::FullscreenMode::Maximized;
-                    }
-                }
-            }
         }
         self.screen_key = key;
         let live_after = self.live_screens();
@@ -1014,6 +1006,10 @@ pub struct WmDesk {
     #[rust] compositor: Option<BackdropCompositor>,
     #[rust] composing: bool,
     #[rust] terminal_clients: HashSet<ClientId>,
+    /// Clients drawn fullscreen across their screens this frame
+    /// (`ScreenSet::span_rects`): no border, title bar or shadow, so the
+    /// child's rect is exactly the screens' rect.
+    #[rust] spanned_tiles: Vec<ClientId>,
     #[rust] blur_counts: (usize, usize),
     #[live] terminal_glass: GaussRoundedView,
     #[live] chrome: DrawDesktopChrome,
@@ -1342,8 +1338,9 @@ impl WmDesk {
         let dpi = cx.current_dpi_factor().max(1.0);
         draw_rect = snap_to_device(draw_rect, dpi);
 
-        let inset = self.style.value([BORDER_SIZE, 0.0, 0.0, 3.0, 1.0]);
-        let resize_bar = self.style.weights[4] * 8.0;
+        let spanned = self.spanned_tiles.contains(&client);
+        let inset = if spanned { 0.0 } else { self.style.value([BORDER_SIZE, 0.0, 0.0, 3.0, 1.0]) };
+        let resize_bar = if spanned { 0.0 } else { self.style.weights[4] * 8.0 };
         let mut inner = snap_child_rect(
             Rect {
                 pos: draw_rect.pos + dvec2(inset, inset),
@@ -1364,8 +1361,10 @@ impl WmDesk {
         let backdrop = if self.composing && (self.terminal_clients.contains(&client) || startup_glass) {
             Some(self.compositor.as_mut().unwrap().backdrop(cx, inner, 3.0))
         } else {None};
-        let rounding = self.style.value([0.0, 14.0, 8.0, 0.0, 0.0]);
-        self.draw_window_shadow(cx, draw_rect, focus, fade);
+        let rounding = if spanned { 0.0 } else { self.style.value([0.0, 14.0, 8.0, 0.0, 0.0]) };
+        if !spanned {
+            self.draw_window_shadow(cx, draw_rect, focus, fade);
+        }
         let mut capture = self.dock_warps.get_mut(&client)
             .filter(|w| w.frame.is_none() || w.refresh)
             .map(|w| {
@@ -1377,7 +1376,7 @@ impl WmDesk {
         if let Some(snapshot) = backdrop {
             self.terminal_glass.draw_surface_with_backdrop(cx, inner, Some(snapshot), fade as f32);
         }
-        let title_h = self.style.title_height().min((inner.size.y * 0.3).max(0.0));
+        let title_h = if spanned { 0.0 } else { self.style.title_height().min((inner.size.y * 0.3).max(0.0)) };
         if title_h > 0.1 {
             self.draw_window_chrome(cx, client, draw_rect, title_h, focus, fade);
             inner.pos.y += title_h;
@@ -1417,7 +1416,7 @@ impl WmDesk {
         self.draw_border.color_end = fade_color(ring_end, fade);
         self.draw_border.angle = borders.angle;
         self.draw_border.border_size = BORDER_SIZE as f32;
-        if self.style.weights[0] > 0.001 {
+        if self.style.weights[0] > 0.001 && !spanned {
             self.draw_border.color.w *= self.style.weights[0] as f32;
             self.draw_border.color_end.w *= self.style.weights[0] as f32;
             self.draw_border.draw_abs(cx, draw_rect);
@@ -1443,8 +1442,8 @@ impl WmDesk {
         // Chrome may still be morphing, but its intermediate border/taskbar
         // dimensions must never become another child resize request.
         let settled = snap_to_device(Self::lrect_to_rect(target), dpi);
-        let settled_inset = self.style.target_value([BORDER_SIZE, 0.0, 0.0, 3.0, 1.0]);
-        let settled_resize_bar = self.style.target_value([0.0, 0.0, 0.0, 0.0, 8.0]);
+        let settled_inset = if spanned { 0.0 } else { self.style.target_value([BORDER_SIZE, 0.0, 0.0, 3.0, 1.0]) };
+        let settled_resize_bar = if spanned { 0.0 } else { self.style.target_value([0.0, 0.0, 0.0, 0.0, 8.0]) };
         let mut settled_inner = snap_child_rect(
             Rect {
                 pos: settled.pos + dvec2(settled_inset, settled_inset),
@@ -1455,7 +1454,7 @@ impl WmDesk {
             },
             dpi,
         );
-        let title_h = self.style.target.title_height().min(settled_inner.size.y * 0.3);
+        let title_h = if spanned { 0.0 } else { self.style.target.title_height().min(settled_inner.size.y * 0.3) };
         settled_inner.pos.y += title_h;
         settled_inner.size.y = (settled_inner.size.y-title_h).max(1.0);
         let (_, settled_child) = split_groupbar(settled_inner, grouped);
@@ -1867,6 +1866,9 @@ impl Widget for WmDesk {
             (rect.size.x - gaps_out * 2.0).max(1.0),
             (rect.size.y - gaps_out * 2.0).max(1.0),
         );
+        // A layout change since the last frame may have ended a span (a
+        // close, a float, a workspace move): settle them before drawing.
+        state.screens.normalize_spans();
         // Each screen tiles its own layout in its own area (the dock only
         // reserved on the main one); the single desk is the one area above.
         let shown: Vec<(usize, LRect)> = if state.per_screen() {
@@ -1879,10 +1881,16 @@ impl Widget for WmDesk {
         };
         // `rects` already hands floats (and the scratchpad) back after the
         // tiled windows, so drawing in order puts them on top.
+        // A screen a span covers shows only the span's client, drawn once
+        // over all of its screens: its own tiles and floats are hidden.
+        let spans: Vec<(ClientId, LRect)> = if state.per_screen() { state.screens.span_rects() } else { Vec::new() };
         let mut targets: Vec<(ClientId, LRect)> = shown
             .iter()
+            .filter(|(i, _)| state.screens.spanned(*i).is_none())
             .flat_map(|(i, a)| state.layout_at(*i).rects(*a, gap))
             .collect();
+        targets.extend(spans.iter().copied());
+        self.spanned_tiles = spans.iter().map(|(c, _)| *c).collect();
         if shown.len() > 1 {
             // Every screen's tiles under every screen's floats, the
             // dragged window on top: a float crossing a seam (it changes
@@ -1965,7 +1973,7 @@ impl Widget for WmDesk {
         let prev_groups = std::mem::take(&mut self.prev_group_members);
         let groups: Vec<_> = shown
             .iter()
-            .filter(|(i, _)| !state.layout_at(*i).desktop.enabled)
+            .filter(|(i, _)| !state.layout_at(*i).desktop.enabled && state.screens.spanned(*i).is_none())
             .flat_map(|(i, a)| state.layout_at(*i).groups(*a, gap))
             .collect();
         for group in groups {

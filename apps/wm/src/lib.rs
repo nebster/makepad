@@ -1464,27 +1464,66 @@ impl App {
                     self.redraw_all(cx);
                 }
             }
+            // `SetFullscreen` is the `Current` span (or leaving it).
             WmRequest::SetFullscreen { fullscreen } => {
-                self.focus_client(cx, client);
-                let on = self.state_mut().layout().fullscreen_mode() != FullscreenMode::None;
-                if on != *fullscreen {
-                    self.do_action(cx, WmAction::Fullscreen(FullscreenMode::Fullscreen));
+                let span = fullscreen.then_some(ScreenSpan::Current);
+                self.set_client_span(cx, client, span);
+            }
+            WmRequest::SetFullscreenSpan { span } => self.set_client_span(cx, client, span.clone()),
+        }
+    }
+
+    /// `client` asked to be drawn fullscreen across `span` (`None`: leave
+    /// it). With several screens this is `ScreenSet::set_span` /
+    /// `clear_span`; on one screen it is today's single-desk fullscreen
+    /// (any span that resolves there covers that one screen). A span that
+    /// cannot be honoured (an unknown or non-adjacent screen, a client
+    /// that is not on a live screen) is logged and the client leaves
+    /// fullscreen, so the `WmEvent::Screens` it is sent next carries
+    /// `span: None` and matches what the desk shows.
+    fn set_client_span(&mut self, cx: &mut Cx, client: ClientId, span: Option<ScreenSpan>) {
+        let state = self.state_mut();
+        let several = state.screens.live_count() >= 2;
+        let result = match (&span, several) {
+            (None, true) => {
+                state.screens.clear_span(client);
+                Ok(())
+            }
+            (Some(span), true) => {
+                let (gap, reserved, gaps_out) = (state.gap, state.style.reserved_height(), state.gaps_out);
+                state.screens.set_span(client, span, gap, reserved, gaps_out)
+            }
+            (Some(span), false) => {
+                let live = state.screens.live_wm_screens();
+                let current = state.screens.screen_of(client);
+                makepad_wm_api::span_rect(&live, span, current).map(|_| ())
+            }
+            (None, false) => Ok(()),
+        };
+        match result {
+            Err(err) => {
+                log!("wm: client {} cannot span {:?}: {:?}", client, span, err);
+                self.state_mut().screens.clear_span(client);
+                self.resend_screens_event(client);
+            }
+            Ok(()) if several => {
+                if span.is_some() {
+                    self.focus_client(cx, client);
                 }
             }
-            // `Current` / `None` are `SetFullscreen`. Spanning other or
-            // several screens is not supported yet: the app is told its
-            // unchanged state, so it does not wait for a span it never got.
-            WmRequest::SetFullscreenSpan { span } => match span {
-                None | Some(ScreenSpan::Current) => {
-                    let fullscreen = span.is_some();
-                    self.on_wm_request(cx, client, WmRequest::SetFullscreen { fullscreen });
+            Ok(()) => {
+                // One screen: SUPER+F's own path (the bar hides with it).
+                self.focus_client(cx, client);
+                let on = self.state_mut().layout().fullscreen_mode() != FullscreenMode::None;
+                if on != span.is_some() {
+                    self.do_action(cx, WmAction::Fullscreen(FullscreenMode::Fullscreen));
                 }
-                Some(other) => {
-                    log!("wm: client {} asked to span {:?}: not supported yet", client, other);
-                    self.resend_screens_event(client);
-                }
-            },
+                return;
+            }
         }
+        self.sync_bar_for_fullscreen(cx);
+        self.update_bar(cx);
+        self.redraw_all(cx);
     }
 
     /// Bring every tiled client's `WmEvent::Screens` up to date after a
@@ -1917,6 +1956,8 @@ impl App {
         if let Some(app) = self.state_mut().phone.tiles.forget_client(client) {
             log!("wm: home tile {} lost client {}", app, client);
         }
+        // A closing spanned window frees its screens.
+        self.state_mut().screens.clear_span(client);
         self.state_mut().layout_of_mut(client).remove(client);
         self.state_mut().clients.remove(&client);
         // A dying warm viewer (or its requester) clears the cache's
@@ -4038,7 +4079,9 @@ impl App {
             return;
         };
         if !self.ai_pane_is_open(cx) {
-            if let Some(c) = self.screen_keyboard_client(i) {
+            // Over a span: its window (on its home screen `i`).
+            let spanned = self.state_mut().screens.spanned(i);
+            if let Some(c) = spanned.or_else(|| self.screen_keyboard_client(i)) {
                 self.focus_client(cx, c);
             } else {
                 // An empty screen, or one whose focused window is a
@@ -4122,16 +4165,24 @@ impl App {
                 }
             }
             WmAction::Fullscreen(mode) => {
-                // Several screens share one bar strip, which cannot hide
-                // over one screen only: fullscreen maximizes within its
-                // screen and the bar stays (true per-screen fullscreen is
-                // a follow-up).
-                let mode = if mode == FullscreenMode::Fullscreen && self.state_mut().screens.live_count() >= 2 {
-                    FullscreenMode::Maximized
+                let state = self.state_mut();
+                if mode == FullscreenMode::Fullscreen && state.screens.live_count() >= 2 {
+                    // Several screens: SUPER+F toggles a span of the
+                    // focused window's own screen (true fullscreen there,
+                    // the other screens keep their windows).
+                    if let Some(focus) = focus {
+                        if state.screens.span_of(focus).is_some() {
+                            state.screens.clear_span(focus);
+                        } else {
+                            let (reserved, gaps_out) = (state.style.reserved_height(), state.gaps_out);
+                            if let Err(err) = state.screens.set_span(focus, &ScreenSpan::Current, gap, reserved, gaps_out) {
+                                log!("wm: fullscreen of client {}: {:?}", focus, err);
+                            }
+                        }
+                    }
                 } else {
-                    mode
-                };
-                self.state_mut().layout_mut().toggle_fullscreen_mode(mode);
+                    state.layout_mut().toggle_fullscreen_mode(mode);
+                }
             }
             WmAction::TiledFullscreen => {
                 if let Some(focus) = focus {
