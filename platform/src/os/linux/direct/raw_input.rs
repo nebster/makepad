@@ -867,9 +867,10 @@ pub struct RawInput {
     height: f64,
     dpi_factor: f64,
     abs: Vec2d,
-    /// The wide desktop's screens: relative pointer motion stays on them, so
-    /// screens of different heights leave no reachable dead corners.
-    screens: Vec<crate::screen::ScreenGeom>,
+    /// The wide desktop's screens, as `[x, y, width, height]` in raw input's own
+    /// coordinates: relative pointer motion stays on them, so screens of
+    /// different heights leave no reachable dead corners.
+    screen_rects: Vec<[f64; 4]>,
 }
 
 impl RawInput {
@@ -884,7 +885,7 @@ impl RawInput {
             height,
             dpi_factor,
             abs: dvec2(0.0, 0.0),
-            screens: Vec::new(),
+            screen_rects: Vec::new(),
             modifiers: Default::default(),
         };
         input.scan_devices();
@@ -905,16 +906,18 @@ impl RawInput {
         self.clamp_to_screens();
     }
 
-    /// The screens of the wide desktop, in the same coordinates as the
-    /// pointer; an empty list keeps the plain bounds clamp.
-    pub fn set_screens(&mut self, screens: Vec<crate::screen::ScreenGeom>) {
-        self.screens = screens;
+    /// The screens of the wide desktop, as `[x, y, width, height]` in the same
+    /// coordinates as the pointer; an empty list keeps the plain bounds clamp.
+    pub fn set_screen_rects(&mut self, rects: Vec<[f64; 4]>) {
+        self.screen_rects = rects;
         self.clamp_to_screens();
     }
 
     fn clamp_to_screens(&mut self) {
-        if !self.screens.is_empty() {
-            self.abs = crate::screen::clamp_point_to_screens(&self.screens, self.abs);
+        if !self.screen_rects.is_empty() {
+            let (x, y) = crate::linux_wide_desktop::clamp_to_rects(&self.screen_rects, self.abs.x, self.abs.y);
+            self.abs.x = x;
+            self.abs.y = y;
         }
     }
 

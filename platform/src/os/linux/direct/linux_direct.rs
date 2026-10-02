@@ -458,7 +458,24 @@ impl Cx {
             .collect();
         // Desktop order: left to right by position.
         screens.sort_by(|a, b| a.bounds.pos.x.partial_cmp(&b.bounds.pos.x).unwrap_or(std::cmp::Ordering::Equal));
-        direct_app.raw_input.set_screens(screens.clone());
+        // Raw input's pointer lives in its own space (native pixels over the base DPI
+        // factor), which is not necessarily `dpi_factor` above (the window's effective
+        // factor, with any DPI override) — so its rectangles are built separately, from
+        // the same snapshot outputs.
+        let screen_rects: Vec<[f64; 4]> = snapshot
+            .outputs
+            .iter()
+            .filter_map(|output| {
+                let (x, y) = output.desktop_position?;
+                Some([
+                    x as f64 / direct_app.dpi_factor,
+                    y as f64 / direct_app.dpi_factor,
+                    output.width as f64 / direct_app.dpi_factor,
+                    output.height as f64 / direct_app.dpi_factor,
+                ])
+            })
+            .collect();
+        direct_app.raw_input.set_screen_rects(screen_rects);
         crate::screen::set_linux_screens(screens);
         direct_app.published_screens = Some(key);
     }
