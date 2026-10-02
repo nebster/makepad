@@ -38,19 +38,36 @@ pub struct WmScreen {
 #[derive(Clone, Debug, PartialEq, SerJson, DeJson)]
 pub enum SpanError {
     /// Nothing to span: an empty `Screens` list, no screens for `All`, or
-    /// no current screen for `Current`.
+    /// no current screen for `Current` -- including a `current` index
+    /// that is out of range for `screens`, which is folded into this same
+    /// variant rather than treated as a distinct error (`screens` lists
+    /// the live screens; an out-of-range index is equally "no current
+    /// screen among them").
     Empty,
     /// A name in `Screens` is not in `screens`.
     UnknownScreen(String),
     /// The resolved screens are not a contiguous run in `screens`' order.
     NotAdjacent,
+    /// A screen inside the resolved span has non-finite (`NaN`/`±Infinity`)
+    /// or negative-size (`w < 0` or `h < 0`) geometry, so no meaningful
+    /// bounding box exists. Screens outside the resolved span are not
+    /// checked -- only the ones the caller is actually asking to span.
+    BadGeometry,
+}
+
+/// True when `s`'s rect can contribute to a bounding box: every
+/// coordinate finite and both sizes non-negative.
+fn geometry_is_valid(s: &WmScreen) -> bool {
+    s.x.is_finite() && s.y.is_finite() && s.w.is_finite() && s.h.is_finite() && s.w >= 0.0 && s.h >= 0.0
 }
 
 /// Resolve `span` against `screens` (left to right). Returns the
 /// half-open index range it covers and the bounding box of those
 /// screens' rects (their union, including any dead space between
 /// different-height screens). `current` is the window's own screen
-/// index, used only by [`ScreenSpan::Current`].
+/// index, used only by [`ScreenSpan::Current`]: `None` and an
+/// out-of-range index both resolve to [`SpanError::Empty`] (see that
+/// variant's doc) rather than a distinct error.
 pub fn span_rect(
     screens: &[WmScreen],
     span: &ScreenSpan,
@@ -86,15 +103,23 @@ pub fn span_rect(
             0..screens.len()
         }
         ScreenSpan::Current => {
+            // `None` (no current screen) and an out-of-range index both
+            // land here as `Empty`, documented on that variant.
             let idx = current.filter(|&idx| idx < screens.len()).ok_or(SpanError::Empty)?;
             idx..idx + 1
         }
     };
+    if screens[range.clone()].iter().any(|s| !geometry_is_valid(s)) {
+        return Err(SpanError::BadGeometry);
+    }
     let rect = bounding_box(&screens[range.clone()]);
     Ok((range, rect))
 }
 
-/// The union bounding box of `screens`' rects: `(x, y, w, h)`.
+/// The union bounding box of `screens`' rects: `(x, y, w, h)`. Callers
+/// must have already rejected non-finite/negative-size geometry (see
+/// `span_rect`'s `BadGeometry` check) -- `f64::min`/`max` silently ignore
+/// a `NaN` operand, so this alone would not catch it.
 fn bounding_box(screens: &[WmScreen]) -> (f64, f64, f64, f64) {
     let x0 = screens.iter().map(|s| s.x).fold(f64::INFINITY, f64::min);
     let y0 = screens.iter().map(|s| s.y).fold(f64::INFINITY, f64::min);
@@ -112,9 +137,20 @@ fn bounding_box(screens: &[WmScreen]) -> (f64, f64, f64, f64) {
 /// `screens` translated so a window sitting at `(window_x, window_y)` in
 /// the same space `screens` are given in sees its own position as the
 /// origin: each rect shifts by `(-window_x, -window_y)`, sizes unchanged.
+///
+/// Guards non-finite input rather than propagating `NaN`/`Infinity`
+/// downstream: a screen whose own geometry is not finite or has a
+/// negative size (see `span_rect`'s `BadGeometry`) is skipped and left
+/// out of the result; if `window_x`/`window_y` themselves are not
+/// finite, there is no meaningful origin to translate by, so every
+/// screen is skipped and an empty `Vec` is returned.
 pub fn screens_in_window(screens: &[WmScreen], window_x: f64, window_y: f64) -> Vec<WmScreen> {
+    if !window_x.is_finite() || !window_y.is_finite() {
+        return Vec::new();
+    }
     screens
         .iter()
+        .filter(|s| geometry_is_valid(s))
         .map(|s| WmScreen {
             name: s.name.clone(),
             x: s.x - window_x,
@@ -262,6 +298,66 @@ mod tests {
     }
 
     #[test]
+    fn nan_coordinate_errors() {
+        let screens = vec![screen("a", f64::NAN, 0.0, 1920.0, 1080.0)];
+        let span = ScreenSpan::Screens(vec!["a".into()]);
+        assert_eq!(span_rect(&screens, &span, None), Err(SpanError::BadGeometry));
+    }
+
+    #[test]
+    fn infinite_size_errors() {
+        let screens = vec![screen("a", 0.0, 0.0, f64::INFINITY, 1080.0)];
+        assert_eq!(
+            span_rect(&screens, &ScreenSpan::All, None),
+            Err(SpanError::BadGeometry)
+        );
+    }
+
+    #[test]
+    fn negative_size_errors() {
+        let screens = vec![screen("a", 0.0, 0.0, -100.0, 1080.0)];
+        assert_eq!(
+            span_rect(&screens, &ScreenSpan::All, None),
+            Err(SpanError::BadGeometry)
+        );
+    }
+
+    #[test]
+    fn bad_geometry_outside_the_resolved_span_is_ignored() {
+        // "bad" is not part of the "a","b" span, so its NaN x must not
+        // fail the call -- only screens inside the resolved range count.
+        let mut screens = three();
+        screens.push(screen("bad", f64::NAN, 0.0, 1.0, 1.0));
+        let span = ScreenSpan::Screens(vec!["a".into(), "b".into()]);
+        let (range, rect) = span_rect(&screens, &span, None).unwrap();
+        assert_eq!(range, 0..2);
+        assert_eq!(rect, (0.0, 0.0, 3840.0, 1080.0));
+    }
+
+    #[test]
+    fn screens_in_window_skips_non_finite_screens() {
+        let screens = vec![
+            screen("a", 0.0, 0.0, 1920.0, 1080.0),
+            screen("nan-x", f64::NAN, 0.0, 1920.0, 1080.0),
+            screen("inf-w", 0.0, 0.0, f64::INFINITY, 1080.0),
+            screen("negative-h", 0.0, 0.0, 1920.0, -1.0),
+        ];
+        let local = screens_in_window(&screens, 0.0, 0.0);
+        assert_eq!(local.len(), 1);
+        assert_eq!(local[0].name, "a");
+    }
+
+    #[test]
+    fn screens_in_window_guards_non_finite_origin() {
+        let screens = three();
+        assert_eq!(screens_in_window(&screens, f64::NAN, 0.0), Vec::new());
+        assert_eq!(
+            screens_in_window(&screens, 0.0, f64::NEG_INFINITY),
+            Vec::new()
+        );
+    }
+
+    #[test]
     fn screen_span_json_round_trip() {
         for span in [
             ScreenSpan::All,
@@ -288,6 +384,7 @@ mod tests {
             SpanError::Empty,
             SpanError::NotAdjacent,
             SpanError::UnknownScreen("x".into()),
+            SpanError::BadGeometry,
         ] {
             let json = err.serialize_json();
             let parsed = SpanError::deserialize_json(&json).unwrap();
