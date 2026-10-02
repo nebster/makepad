@@ -50,6 +50,23 @@
 # override; that flag is always unset first so a stale one from the
 # caller's environment cannot persist by accident.
 #
+# `MAKEPAD_DISPLAY_ORDER` and `MAKEPAD_DRM_MODES` get the same treatment,
+# but with one marker each -- `MAKEPAD_WM_ORDER_FROM_SAVED=1` /
+# `MAKEPAD_WM_MODES_FROM_SAVED=1` -- rather than a single combined flag,
+# because the two variables are independent exports that can disagree
+# about which one this helper set from the file and which one was
+# already pinned from outside (e.g. a caller that only pins the order).
+# A single marker could not tell the two cases apart; the worker reads
+# both into `SystemSnapshot::order_env`/`modes_env` (`system_linux.rs`),
+# and its runtime restore of the saved layout
+# (`display_layout::env_restore_plan`, `linux_controls.rs`) skips the
+# Order op entirely while `order_env` is pinned, and a screen's Mode op
+# while that screen's name appears in a pinned `modes_env` -- the same
+# "an externally set env var always wins" rule this helper already
+# applies at session start, now honoured by the WM's own safety-net
+# restore too (review 2026-10-02, I1). Both markers are always unset
+# first, same reason as the GPU one.
+#
 # One line per export/skip decision is logged to stderr, prefixed
 # `display-layout:`.
 
@@ -263,14 +280,20 @@ _mdl_main() {
         [ "$had_noglob" = 1 ] || set +f
     fi
 
+    unset MAKEPAD_WM_ORDER_FROM_SAVED
     if [ -n "$order_list" ]; then
-        _mdl_set_env MAKEPAD_DISPLAY_ORDER "$order_list" "from display-layout"
+        if _mdl_set_env MAKEPAD_DISPLAY_ORDER "$order_list" "from display-layout"; then
+            export MAKEPAD_WM_ORDER_FROM_SAVED=1
+        fi
     else
         echo "display-layout: no resolvable screen order; MAKEPAD_DISPLAY_ORDER left to the platform" >&2
     fi
 
+    unset MAKEPAD_WM_MODES_FROM_SAVED
     if [ -n "$modes_list" ]; then
-        _mdl_set_env MAKEPAD_DRM_MODES "$modes_list" "from display-layout"
+        if _mdl_set_env MAKEPAD_DRM_MODES "$modes_list" "from display-layout"; then
+            export MAKEPAD_WM_MODES_FROM_SAVED=1
+        fi
     else
         echo "display-layout: no saved modes; MAKEPAD_DRM_MODES left to the platform" >&2
     fi
