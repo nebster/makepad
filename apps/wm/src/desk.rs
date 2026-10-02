@@ -358,7 +358,9 @@ pub struct WmState {
     pub phone: crate::mobile::PhoneState,
     pub style: StyleTween,
     pub dock_backdrop: Option<gauss_view::GaussBlurSnapshot>,
-    pub layout: WmLayout,
+    /// One layout per physical screen (a single `""` entry covering the
+    /// desk off the multi-screen Linux direct desktop, which is today's WM).
+    pub screens: crate::screens::ScreenSet,
     pub clients: HashMap<ClientId, ClientSlot>,
     pub hub_port: u16,
     pub theme_name: String,
@@ -403,8 +405,18 @@ pub struct WmState {
 }
 
 impl WmState {
+    /// The active screen's layout: where new windows, workspace keys and
+    /// the focused window live.
+    pub fn layout(&self) -> &WmLayout {
+        self.screens.active_layout()
+    }
+
+    pub fn layout_mut(&mut self) -> &mut WmLayout {
+        self.screens.active_layout_mut()
+    }
+
     pub fn focused_terminal_cwd(&self) -> Option<std::path::PathBuf> {
-        let focus = self.layout.focused_client()?;
+        let focus = self.layout().focused_client()?;
         let slot = self.clients.get(&focus)?;
         if slot.app == "terminal" {
             slot.pwd.clone()
@@ -1412,8 +1424,8 @@ impl WmDesk {
                 // `group_set_active` acts on the FOCUSED leaf, so focus the
                 // group's visible member first — the click may well have
                 // landed on a strip belonging to some other tile.
-                state.layout.set_focus(visible);
-                state.layout.group_set_active(index + 1);
+                state.layout_mut().set_focus(visible);
+                state.layout_mut().group_set_active(index + 1);
             }
         }
         // The same press may still turn into a tear-out; until it travels
@@ -1651,12 +1663,12 @@ impl Widget for WmDesk {
         );
         // `rects` already hands floats (and the scratchpad) back after the
         // tiled windows, so drawing in order puts them on top.
-        let mut targets = state.layout.rects(area, gap);
+        let mut targets = state.layout().rects(area, gap);
         let was_minimized = self.minimized.clone();
-        self.minimized = state.layout.clients_on(state.layout.active).into_iter().filter(|c| state.layout.desktop.minimized(*c)).collect();
+        self.minimized = state.layout().clients_on(state.layout().active).into_iter().filter(|c| state.layout().desktop.minimized(*c)).collect();
         if self.style.target == crate::desktop::DesktopStyle::Macos {
             let size=cx.owning_window_or_root_pass_size();
-            for client in state.layout.clients_on(state.layout.active) {
+            for client in state.layout().clients_on(state.layout().active) {
                 let hidden=self.minimized.contains(&client);
                 let restored=was_minimized.contains(&client) && !hidden;
                 if (hidden && !was_minimized.contains(&client)) || restored {
@@ -1689,7 +1701,7 @@ impl Widget for WmDesk {
                 targets.push((*client,LRect::new(rect.pos.x+rect.size.x*0.5,rect.pos.y+rect.size.y+12.0,48.0,34.0)));
             }
         }
-        let focused = state.layout.focused_client();
+        let focused = state.layout().focused_client();
         self.accent = state.accent;
         self.hint = state.drop_hint;
         let borders = state.borders;
@@ -1715,14 +1727,14 @@ impl Widget for WmDesk {
         self.group_tabs.clear();
         self.tab_hits.clear();
         let prev_groups = std::mem::take(&mut self.prev_group_members);
-        for group in state.layout.groups(area, gap).into_iter().filter(|_| !state.layout.desktop.enabled) {
+        for group in state.layout().groups(area, gap).into_iter().filter(|_| !state.layout().desktop.enabled) {
             let Some(visible) = group.clients.get(group.active).copied() else {
                 continue;
             };
             // A fullscreen window is exactly the one place a strip must not
             // steal a row: it is showing one member, full bleed.
             let drawn = targets.iter().any(|(c, _)| *c == visible);
-            if !drawn || state.layout.is_client_fullscreen(visible) {
+            if !drawn || state.layout().is_client_fullscreen(visible) {
                 continue;
             }
             let members = group

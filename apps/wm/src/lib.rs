@@ -926,7 +926,7 @@ impl App {
                 let area = self.desk_area(cx);
                 let state = self.state_mut();
                 let gap = state.gap;
-                state.layout.insert(id, area, gap);
+                state.layout_mut().insert(id, area, gap);
                 let hub_port = state.hub_port;
                 self.desk(cx)
                     .borrow_mut::<WmDesk>()
@@ -1034,7 +1034,7 @@ impl App {
                 slot.opened_warm = true;
             }
             let gap = state.gap;
-            state.layout.insert(client, area, gap);
+            state.layout_mut().insert(client, area, gap);
         }
         let hub_port = self.state_mut().hub_port;
         // The tile configures the child to its REAL rect on its next tick
@@ -1411,15 +1411,15 @@ impl App {
             WmRequest::SetFloating { floating } => {
                 let area = self.desk_area(cx);
                 let gap = self.state_mut().gap;
-                let is_float = self.state_mut().layout.is_float(client);
+                let is_float = self.state_mut().layout().is_float(client);
                 if is_float != *floating {
-                    self.state_mut().layout.toggle_float(client, area, gap);
+                    self.state_mut().layout_mut().toggle_float(client, area, gap);
                     self.redraw_all(cx);
                 }
             }
             WmRequest::SetFullscreen { fullscreen } => {
                 self.focus_client(cx, client);
-                let on = self.state_mut().layout.fullscreen_mode() != FullscreenMode::None;
+                let on = self.state_mut().layout().fullscreen_mode() != FullscreenMode::None;
                 if on != *fullscreen {
                     self.do_action(cx, WmAction::Fullscreen(FullscreenMode::Fullscreen));
                 }
@@ -1455,7 +1455,7 @@ impl App {
         let area = self.desk_area(cx);
         let state = self.state_mut();
         let gap = state.gap;
-        state.layout.insert(id, area, gap);
+        state.layout_mut().insert(id, area, gap);
         let hub_port = state.hub_port;
         self.desk(cx).borrow_mut::<WmDesk>().map(|mut d| {
             d.with_run_view(cx, id, |cx, v| v.set_run_target(cx, id, 0, hub_port))
@@ -1616,9 +1616,9 @@ impl App {
         let area = self.desk_area(cx);
         let state = self.state_mut();
         let gap = state.gap;
-        let ws = state.layout.active;
-        let rect = state.layout.popup_rect(area, gap, 900.0, 700.0);
-        state.layout.add_preview_float(client, rect, ws);
+        let ws = state.layout().active;
+        let rect = state.layout().popup_rect(area, gap, 900.0, 700.0);
+        state.layout_mut().add_preview_float(client, rect, ws);
         self.desk(cx).borrow_mut::<WmDesk>().map(|mut d| {
             d.with_run_view(cx, client, |_cx, v| v.set_takes_key_focus(false))
         });
@@ -1643,7 +1643,7 @@ impl App {
         // Out of the layout, but NOT out of the desk: `WmDesk::remove_client`
         // would drop the tile widget (and with it the child's swapchain and
         // this viewer's warmth) once its close animation finished.
-        self.state_mut().layout.remove(active.client);
+        self.state_mut().layout_mut().remove(active.client);
         log!(
             "wm: preview hide client {} ({}), viewer stays warm",
             active.client,
@@ -1672,7 +1672,7 @@ impl App {
         // Only the app that is dialing loses its Space/Escape to the panel.
         // Focus somewhere else (a terminal the user tabbed to while the
         // panel stayed up) means Space is a space again.
-        let focus = self.state_mut().layout.focused_client();
+        let focus = self.state_mut().layout().focused_client();
         match focus {
             Some(client) if !self.preview_cache.is_requester(client) => return false,
             _ => {}
@@ -1686,7 +1686,7 @@ impl App {
     /// reflow and the close animation plays with its last frame), the
     /// process gets `CLOSE_GRACE` to exit, and only then is it killed.
     fn close_focused(&mut self, cx: &mut Cx) {
-        let Some(focus) = self.state_mut().layout.focused_client() else {
+        let Some(focus) = self.state_mut().layout().focused_client() else {
             return;
         };
         self.request_close(cx, focus);
@@ -1730,7 +1730,7 @@ impl App {
         }
         // Out of the layout now: the tiles reflow and the desk plays the
         // popin-out with the frame the tile already has.
-        self.state_mut().layout.remove(client);
+        self.state_mut().layout_mut().remove(client);
         if let Some(mut desk) = self.desk(cx).borrow_mut::<WmDesk>() {
             desk.remove_client(client);
         }
@@ -1814,7 +1814,7 @@ impl App {
         if let Some(app) = self.state_mut().phone.tiles.forget_client(client) {
             log!("wm: home tile {} lost client {}", app, client);
         }
-        self.state_mut().layout.remove(client);
+        self.state_mut().layout_mut().remove(client);
         self.state_mut().clients.remove(&client);
         // A dying warm viewer (or its requester) clears the cache's
         // reference to it — "if a viewer process dies clear its slot, so
@@ -1884,14 +1884,14 @@ impl App {
                 }
             }
         }
-        if let Some(ws) = self.state_mut().layout.workspace_of(client) {
+        if let Some(ws) = self.state_mut().layout().workspace_of(client) {
             let state = self.state_mut();
-            if ws != state.layout.active {
-                state.layout.switch_workspace(ws);
+            if ws != state.layout().active {
+                state.layout_mut().switch_workspace(ws);
             }
-            state.layout.workspaces[ws].focus = Some(client);
-            state.layout.note_focus(client);
-            if state.layout.desktop.enabled {state.layout.raise_float(client);}
+            state.layout_mut().workspaces[ws].focus = Some(client);
+            state.layout_mut().note_focus(client);
+            if state.layout().desktop.enabled {state.layout_mut().raise_float(client);}
         }
         // The tile widget only exists once the desk has drawn it, and its
         // Area only after its first draw — a focus at launch time lands on
@@ -2380,7 +2380,7 @@ impl App {
         } else {
             let area = self.desk_area(cx);
             let gap = self.state_mut().gap;
-            self.state_mut().layout.insert(id, area, gap);
+            self.state_mut().layout_mut().insert(id, area, gap);
             if self.state_mut().style.target.mobile() {
                 self.activate_client(cx, id);
             }
@@ -2498,7 +2498,7 @@ impl App {
             .clients
             .insert(id, clients::ClientSlot::module(id, module.id(), module.label()));
         let gap = self.state_mut().gap;
-        self.state_mut().layout.insert(id, area, gap);
+        self.state_mut().layout_mut().insert(id, area, gap);
         // The tile is a module tile from its first draw; the root is seated
         // in it before anything asks it to draw.
         self.desk(cx).borrow_mut::<WmDesk>().map(|mut d| {
@@ -2627,7 +2627,7 @@ impl App {
     fn app_rows(&mut self) -> Vec<OsAppRow> {
         let launchable = self.apps.launchable();
         let state = self.state_mut();
-        let focused = state.layout.focused_client();
+        let focused = state.layout().focused_client();
         let mut rows: Vec<OsAppRow> = clients::registry()
             .iter()
             .filter(|a| launchable.allows(a))
@@ -2642,7 +2642,7 @@ impl App {
             .clients
             .iter()
             .filter(|(id, s)| {
-                !s.warm && !s.pane && s.closing.is_none() && state.layout.workspace_of(**id).is_some()
+                !s.warm && !s.pane && s.closing.is_none() && state.layout().workspace_of(**id).is_some()
             })
             .map(|(id, s)| (*id, s.app.clone()))
             .collect();
@@ -2678,7 +2678,7 @@ impl App {
                     && !s.warm
                     && !s.pane
                     && s.closing.is_none()
-                    && state.layout.workspace_of(**id).is_some()
+                    && state.layout().workspace_of(**id).is_some()
             })
             .map(|(id, _)| *id)
             .collect();
@@ -3191,7 +3191,7 @@ impl App {
                 m.close(cx);
             }
         }
-        if let Some(focus) = self.state_mut().layout.focused_client() {
+        if let Some(focus) = self.state_mut().layout().focused_client() {
             self.focus_client(cx, focus);
         }
         self.redraw_all(cx);
@@ -3451,12 +3451,12 @@ impl App {
         let mut shown: Vec<usize> = Vec::new();
         let workspaces = {
             let state = self.state_mut();
-            let active = state.layout.active;
+            let active = state.layout().active;
             let mut cells: Vec<shell::bar::WorkspaceCell> = Vec::new();
             // Omarchy's bar: the active workspace is a dot, other POPULATED
             // ones show their number, empty ones are hidden.
             for i in 0..layout::WORKSPACES {
-                let populated = !state.layout.clients_on(i).is_empty();
+                let populated = !state.layout().clients_on(i).is_empty();
                 if i != active && !populated {
                     continue;
                 }
@@ -3473,7 +3473,7 @@ impl App {
         let title = {
             let state = self.state_mut();
             state
-                .layout
+                .layout()
                 .focused_client()
                 .and_then(|c| state.clients.get(&c))
                 .map(|s| s.display_title().to_string())
@@ -3641,7 +3641,7 @@ impl App {
             .map(|d| d.desk_rect)
             .unwrap_or_default();
         if rect.size.x > 1.0 {
-            self.state_mut().layout.set_outer(LRect::new(
+            self.state_mut().layout_mut().set_outer(LRect::new(
                 rect.pos.x,
                 rect.pos.y,
                 rect.size.x,
@@ -3669,7 +3669,7 @@ impl App {
             self.request_close(cx, client);
         }
         self.preview_cache.clear();
-        self.state_mut().layout.switch_workspace(0);
+        self.state_mut().layout_mut().switch_workspace(0);
         self.redraw_all(cx);
     }
 
@@ -3694,7 +3694,7 @@ impl App {
     /// fullscreen puts it back, unless SUPER+SHIFT+SPACE hid it.
     fn sync_bar_for_fullscreen(&mut self, cx: &mut Cx) {
         let fullscreen = {
-            let layout = &self.state_mut().layout;
+            let layout = self.state_mut().layout();
             let ws = layout.focus_ws();
             layout.workspaces[ws].fullscreen.is_some()
                 && layout.workspaces[ws].fullscreen_mode == FullscreenMode::Fullscreen
@@ -3722,7 +3722,7 @@ impl App {
             self.focus_pane(cx);
             return;
         }
-        if let Some(focus) = self.state_mut().layout.focused_client() {
+        if let Some(focus) = self.state_mut().layout().focused_client() {
             self.focus_client(cx, focus);
         }
     }
@@ -3731,38 +3731,38 @@ impl App {
         self.sync_geometry(cx);
         let area = self.desk_area(cx);
         let gap = self.state_mut().gap;
-        let focus = self.state_mut().layout.focused_client();
+        let focus = self.state_mut().layout().focused_client();
         match action {
             WmAction::LaunchTerminal => self.launch_app(cx, "terminal"),
             WmAction::LaunchBrowser => self.launch_app(cx, "browser"),
             WmAction::CloseWindow => self.close_focused(cx),
             WmAction::CloseAllWindows => self.close_all_windows(cx),
             WmAction::ToggleSplit => {
-                self.state_mut().layout.toggle_split();
+                self.state_mut().layout_mut().toggle_split();
             }
             WmAction::TogglePseudo => {
                 if let Some(focus) = focus {
-                    self.state_mut().layout.toggle_pseudo(focus, area, gap);
+                    self.state_mut().layout_mut().toggle_pseudo(focus, area, gap);
                 }
             }
             WmAction::ToggleFloat => {
                 if let Some(focus) = focus {
-                    self.state_mut().layout.toggle_float(focus, area, gap);
+                    self.state_mut().layout_mut().toggle_float(focus, area, gap);
                     self.focus_client(cx, focus);
                 }
             }
             WmAction::PopOut => {
                 if let Some(focus) = focus {
-                    self.state_mut().layout.pop_out(focus, area, gap);
+                    self.state_mut().layout_mut().pop_out(focus, area, gap);
                     self.focus_client(cx, focus);
                 }
             }
             WmAction::Fullscreen(mode) => {
-                self.state_mut().layout.toggle_fullscreen_mode(mode);
+                self.state_mut().layout_mut().toggle_fullscreen_mode(mode);
             }
             WmAction::TiledFullscreen => {
                 if let Some(focus) = focus {
-                    let on = self.state_mut().layout.toggle_client_fullscreen(focus);
+                    let on = self.state_mut().layout_mut().toggle_client_fullscreen(focus);
                     // fullscreenstate 0 2: the client is told, the layout is
                     // untouched. Our children learn it as a custom message.
                     if let Some(slot) = self.state_mut().clients.get(&focus) {
@@ -3779,90 +3779,90 @@ impl App {
                 }
             }
             WmAction::FocusDir(dir) => {
-                if self.state_mut().layout.focus_dir(dir, area, gap) {
+                if self.state_mut().layout_mut().focus_dir(dir, area, gap) {
                     self.focus_after_layout(cx);
                 }
             }
             WmAction::SwapDir(dir) => {
-                self.state_mut().layout.swap_dir(dir, area, gap);
+                self.state_mut().layout_mut().swap_dir(dir, area, gap);
             }
             WmAction::ResizePx { axis, px } => {
-                self.state_mut().layout.resize_px(axis, px, area, gap);
+                self.state_mut().layout_mut().resize_px(axis, px, area, gap);
             }
             WmAction::CycleFocus(forward) => {
-                self.state_mut().layout.cycle_focus(forward);
+                self.state_mut().layout_mut().cycle_focus(forward);
                 self.focus_after_layout(cx);
             }
             WmAction::ToggleGroup => {
-                self.state_mut().layout.toggle_group(area, gap);
+                self.state_mut().layout_mut().toggle_group(area, gap);
                 self.focus_after_layout(cx);
             }
             WmAction::MoveOutOfGroup => {
-                self.state_mut().layout.move_out_of_group(area, gap);
+                self.state_mut().layout_mut().move_out_of_group(area, gap);
                 self.focus_after_layout(cx);
             }
             WmAction::MoveIntoGroup(dir) => {
-                self.state_mut().layout.move_into_group(dir, area, gap);
+                self.state_mut().layout_mut().move_into_group(dir, area, gap);
                 self.focus_after_layout(cx);
             }
             WmAction::GroupNext => {
-                if self.state_mut().layout.group_cycle(true) {
+                if self.state_mut().layout_mut().group_cycle(true) {
                     self.focus_after_layout(cx);
                 }
             }
             WmAction::GroupPrev => {
-                if self.state_mut().layout.group_cycle(false) {
+                if self.state_mut().layout_mut().group_cycle(false) {
                     self.focus_after_layout(cx);
                 }
             }
             WmAction::GroupActive(n) => {
-                if self.state_mut().layout.group_set_active(n) {
+                if self.state_mut().layout_mut().group_set_active(n) {
                     self.focus_after_layout(cx);
                 }
             }
             WmAction::Workspace(n) => {
-                self.state_mut().layout.switch_workspace(n);
+                self.state_mut().layout_mut().switch_workspace(n);
                 self.focus_after_layout(cx);
             }
             WmAction::MoveToWorkspace(n) => {
-                self.state_mut().layout.move_focused_to_ex(n, true, area, gap);
+                self.state_mut().layout_mut().move_focused_to_ex(n, true, area, gap);
                 self.focus_after_layout(cx);
             }
             WmAction::MoveToWorkspaceSilent(n) => {
                 self.state_mut()
-                    .layout
+                    .layout_mut()
                     .move_focused_to_ex(n, false, area, gap);
             }
             WmAction::WorkspaceNext => {
                 // Hyprland `e+1`: cycle occupied workspaces, not a march
                 // through the empty ones.
-                let layout = &self.state_mut().layout;
+                let layout = self.state_mut().layout();
                 let n = layout.cycle_occupied(layout.active, true);
-                self.state_mut().layout.switch_workspace(n);
+                self.state_mut().layout_mut().switch_workspace(n);
                 self.focus_after_layout(cx);
             }
             WmAction::WorkspacePrev => {
-                let layout = &self.state_mut().layout;
+                let layout = self.state_mut().layout();
                 let n = layout.cycle_occupied(layout.active, false);
-                self.state_mut().layout.switch_workspace(n);
+                self.state_mut().layout_mut().switch_workspace(n);
                 self.focus_after_layout(cx);
             }
             WmAction::WorkspaceFormer => {
-                let former = self.state_mut().layout.former;
-                self.state_mut().layout.switch_workspace(former);
+                let former = self.state_mut().layout().former;
+                self.state_mut().layout_mut().switch_workspace(former);
                 self.focus_after_layout(cx);
             }
             WmAction::ToggleScratchpad => {
-                self.state_mut().layout.toggle_scratchpad();
+                self.state_mut().layout_mut().toggle_scratchpad();
                 self.focus_after_layout(cx);
             }
             WmAction::MoveToScratchpad => {
                 self.state_mut()
-                    .layout
+                    .layout_mut()
                     .move_focused_to_scratchpad(area, gap);
             }
             WmAction::ToggleWorkspaceLayout => {
-                let mode = self.state_mut().layout.toggle_workspace_layout();
+                let mode = self.state_mut().layout_mut().toggle_workspace_layout();
                 // The scrolling algorithm is a follow-on lane; the flag is
                 // live and the layout still draws dwindle.
                 log!("wm: workspace layout -> {:?}", mode);
@@ -3916,7 +3916,7 @@ impl App {
         let gap = self.state_mut().gap;
         let Some(client) = self
             .state_mut()
-            .layout
+            .layout()
             .client_at(abs.x, abs.y, area, gap)
         else {
             return false;
@@ -3938,7 +3938,7 @@ impl App {
         self.sync_geometry(cx);
         let area = self.desk_area(cx);
         let gap = self.state_mut().gap;
-        let layout = &mut self.state_mut().layout;
+        let layout = self.state_mut().layout_mut();
         let floating = layout.is_float(client);
         let Some(rect) = layout.rect_of(client, area, gap) else {
             return false;
@@ -4003,7 +4003,7 @@ impl App {
             }
             drag.armed = true;
             if !drag.resize {
-                if let Some(w)=self.state.as_mut().and_then(|s|s.layout.desktop.get_mut(drag.client)).filter(|w|w.maximized || w.snap.is_some()) {
+                if let Some(w)=self.state.as_mut().and_then(|s|s.layout_mut().desktop.get_mut(drag.client)).filter(|w|w.maximized || w.snap.is_some()) {
                     let anchor=((drag.start.x-drag.start_rect.x)/drag.start_rect.w).clamp(0.0,1.0);
                     w.rect.x=drag.start.x-w.rect.w*anchor;
                     w.rect.y=drag.start.y-16.0;
@@ -4046,14 +4046,14 @@ impl App {
             } else {
                 LRect::new(start_rect.x + d.x, start_rect.y + d.y, start_rect.w, start_rect.h)
             };
-            self.state_mut().layout.set_float_rect(client, rect);
+            self.state_mut().layout_mut().set_float_rect(client, rect);
         } else if resize {
             // Tiled: the divider follows the pointer, one frame at a time,
             // exactly like CDwindleAlgorithm::resizeTarget's Δ.
             let d = abs - last;
             // A tiled resize moves the split ratios: the grabbed edge
             // follows the pointer, so a left/top grab inverts the delta.
-            let layout = &mut self.state_mut().layout;
+            let layout = self.state_mut().layout_mut();
             if d.x.abs() > 0.0 {
                 layout.resize_px(Axis::Horizontal, d.x, area, gap);
             }
@@ -4074,7 +4074,7 @@ impl App {
             let area = self.desk_area(cx);
             let gap = self.state_mut().gap;
             self.state_mut()
-                .layout
+                .layout()
                 .client_at(abs.x, abs.y, area, gap)
                 .filter(|target| *target != client)
         } else {
@@ -4104,7 +4104,7 @@ impl App {
             self.state_mut().snap.drag(drag.client,abs,area);
             if let Some(zone)=self.state_mut().snap.preview {
                 // Preserve the free window's size before the edge drag.
-                if let Some(w)=self.state_mut().layout.desktop.get_mut(drag.client) {w.rect=drag.start_rect;}
+                if let Some(w)=self.state_mut().layout_mut().desktop.get_mut(drag.client) {w.rect=drag.start_rect;}
                 self.apply_snap(cx,drag.client,zone);
             }
         }
@@ -4116,11 +4116,11 @@ impl App {
             let gap = self.state_mut().gap;
             if let Some(target) = self
                 .state_mut()
-                .layout
+                .layout()
                 .client_at(abs.x, abs.y, area, gap)
             {
                 if target != drag.client {
-                    let layout = &mut self.state_mut().layout;
+                    let layout = self.state_mut().layout_mut();
                     if shift {
                         layout.group_drop(drag.client, target);
                     } else {
@@ -4151,19 +4151,19 @@ impl App {
         // gap shadows the divider the way it shadows the wallpaper.
         if self
             .state_mut()
-            .layout
+            .layout()
             .client_at(abs.x, abs.y, area, gap)
             .is_some()
         {
             return false;
         }
-        let Some(hit) = self.state_mut().layout.divider_at(abs.x, abs.y, area, gap) else {
+        let Some(hit) = self.state_mut().layout().divider_at(abs.x, abs.y, area, gap) else {
             return false;
         };
         // Both sides of the split resize live: name every client under it
         // so `WmDesk` snaps their tiles instead of restarting the 379ms
         // layout tween on each pointer frame (see `WmState::dragging`).
-        let clients = self.state_mut().layout.clients_under(&hit);
+        let clients = self.state_mut().layout().clients_under(&hit);
         log!(
             "wm: divider grab {:?} depth {} ratio {:.3} over {} tiles",
             hit.axis,
@@ -4190,7 +4190,7 @@ impl App {
         // 1:1 with the pointer, always measured from the grab: no tween,
         // no accumulated delta, and a clamp at either end never eats part
         // of the way back.
-        self.state_mut().layout.drag_divider_px(&hit, px, gap);
+        self.state_mut().layout_mut().drag_divider_px(&hit, px, gap);
         self.apply_divider_cursor(cx, Some(hit.axis));
         self.redraw_all(cx);
     }
@@ -4217,14 +4217,14 @@ impl App {
         let gap = self.state_mut().gap;
         let on_client = self
             .state_mut()
-            .layout
+            .layout()
             .client_at(abs.x, abs.y, area, gap)
             .is_some();
         let axis = if on_client {
             None
         } else {
             self.state_mut()
-                .layout
+                .layout()
                 .divider_at(abs.x, abs.y, area, gap)
                 .map(|hit| hit.axis)
         };
@@ -4267,7 +4267,7 @@ impl App {
     fn tear_out_tab(&mut self, cx: &mut Cx, client: ClientId, abs: Vec2d) {
         let area = self.desk_area(cx);
         let gap = self.state_mut().gap;
-        if !self.state_mut().layout.group_tear_out(client, area, gap) {
+        if !self.state_mut().layout_mut().group_tear_out(client, area, gap) {
             return;
         }
         self.begin_drag_on(cx, client, abs, false, true);
@@ -4278,9 +4278,9 @@ impl App {
 
     /// SUPER + wheel: `focus({ workspace = "e+1" / "e-1" })`.
     fn scroll_workspace(&mut self, cx: &mut Cx, down: bool) {
-        let layout = &self.state_mut().layout;
+        let layout = self.state_mut().layout();
         let n = layout.cycle_occupied(layout.active, down);
-        self.state_mut().layout.switch_workspace(n);
+        self.state_mut().layout_mut().switch_workspace(n);
         self.focus_after_layout(cx);
         self.sync_bar_for_fullscreen(cx);
         self.update_bar(cx);
@@ -4617,7 +4617,10 @@ impl MatchEvent for App {
         self.state = Some(WmState {
             snap: Default::default(),
             phone: Default::default(),
-            layout: crate::layout::WmLayout::new(),
+            screens: crate::screens::ScreenSet::new(
+                crate::layout::WmLayout::new(),
+                LRect::new(0.0, 0.0, 1400.0, 860.0),
+            ),
             dock_backdrop: None,
             clients: std::collections::HashMap::new(),
             hub_port,
@@ -4805,7 +4808,7 @@ impl MatchEvent for App {
                         self.do_action(cx, WmAction::Workspace(ws));
                     }
                     BarModule::ActiveWindow => {
-                        if let Some(focus) = self.state_mut().layout.focused_client() {
+                        if let Some(focus) = self.state_mut().layout().focused_client() {
                             self.focus_client(cx, focus);
                         }
                     }
@@ -4825,7 +4828,7 @@ impl MatchEvent for App {
                     BarModule::Style => self.open_style_menu(cx),
                     BarModule::Menu => self.do_action(cx, WmAction::LaunchTerminal),
                     BarModule::ActiveWindow => {
-                        if let Some(focus) = self.state_mut().layout.focused_client() {
+                        if let Some(focus) = self.state_mut().layout().focused_client() {
                             self.request_close(cx, focus);
                         }
                     }
@@ -4844,7 +4847,7 @@ impl MatchEvent for App {
                     // window exactly like a right click — every other
                     // module ignores the middle button.
                     if module == BarModule::ActiveWindow {
-                        if let Some(focus) = self.state_mut().layout.focused_client() {
+                        if let Some(focus) = self.state_mut().layout().focused_client() {
                             self.request_close(cx, focus);
                         }
                     }
