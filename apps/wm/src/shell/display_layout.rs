@@ -379,6 +379,84 @@ impl DisplayLayout {
     }
 }
 
+impl DisplayLayout {
+    /// Puts the screens keyed by `keys` in that order, each into one of
+    /// the slots those screens held, so every other saved screen (one not
+    /// connected now, a peer's screen still to join) keeps its place
+    /// between them. Keys that are not saved screens are ignored.
+    pub fn reorder(&mut self, keys: &[ScreenKey]) {
+        let current: Vec<ScreenKey> = self.screens.iter().map(|entry| entry.key.clone()).collect();
+        let order = fill_slots(&current, keys);
+        let mut screens = Vec::with_capacity(self.screens.len());
+        for key in order {
+            if let Some(index) = self.screens.iter().position(|entry| entry.key == key) {
+                screens.push(self.screens.remove(index));
+            }
+        }
+        screens.append(&mut self.screens);
+        self.screens = screens;
+    }
+}
+
+/// The Display panel's screen rows: indices into `snap.outputs`, the
+/// placed screens left to right (`desktop_position.x`) first, then the
+/// ones outside the desktop in the snapshot's default order; with how
+/// many of them are placed (the ones that can be moved).
+pub fn screen_rows(snap: &LinuxDisplaySnapshot) -> (Vec<usize>, usize) {
+    let mut placed: Vec<usize> =
+        (0..snap.outputs.len()).filter(|&i| snap.outputs[i].desktop_position.is_some()).collect();
+    placed.sort_by_key(|&i| snap.outputs[i].desktop_position.map(|(x, _)| x).unwrap_or(0));
+    let placed_count = placed.len();
+    placed.extend((0..snap.outputs.len()).filter(|&i| snap.outputs[i].desktop_position.is_none()));
+    (placed, placed_count)
+}
+
+/// `order` with the item at `row` swapped with its left (`dir < 0`) or
+/// right (`dir > 0`) neighbour; `None` past either end.
+pub fn swap_neighbour<T: Clone>(order: &[T], row: usize, dir: i32) -> Option<Vec<T>> {
+    if row >= order.len() || dir == 0 {
+        return None;
+    }
+    let target = if dir < 0 { row.checked_sub(1)? } else { row + 1 };
+    if target >= order.len() {
+        return None;
+    }
+    let mut out = order.to_vec();
+    out.swap(row, target);
+    Some(out)
+}
+
+/// `list` with the items that `wanted` names put in `wanted`'s order,
+/// each into one of the slots those items held; every other item stays
+/// where it was. Items of `wanted` not in `list` are ignored.
+pub fn fill_slots<T: Clone + PartialEq>(list: &[T], wanted: &[T]) -> Vec<T> {
+    let mut queue = wanted.iter().filter(|item| list.contains(item));
+    list.iter()
+        .map(|item| {
+            if wanted.contains(item) {
+                queue.next().cloned().unwrap_or_else(|| item.clone())
+            } else {
+                item.clone()
+            }
+        })
+        .collect()
+}
+
+/// Whether the desktop's screens (placed, or on their way: [`is_joining`])
+/// are driven by more than one card. The renderer cannot switch its GPU
+/// live then, so "Render on" only takes effect at the next start.
+pub fn screens_span_gpus(snap: &LinuxDisplaySnapshot) -> bool {
+    let mut cards = snap
+        .outputs
+        .iter()
+        .filter(|output| output.desktop_position.is_some() || is_joining(output))
+        .map(|output| output.card.as_str());
+    match cards.next() {
+        Some(first) => cards.any(|card| card != first),
+        None => false,
+    }
+}
+
 /// One step of bringing the running desktop in line with the saved
 /// layout: the `Cx::linux_set_display_*` call it stands for.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -495,7 +573,7 @@ pub fn screen_key(output: &LinuxDisplayOutput) -> Option<ScreenKey> {
 
 /// `name` minus its `cardN-` prefix, or `name` unchanged when it does not
 /// have that shape.
-fn connector_suffix(name: &str) -> String {
+pub fn connector_suffix(name: &str) -> String {
     match split_card_prefix(name) {
         Some((_, connector)) => connector.to_string(),
         None => name.to_string(),
@@ -929,5 +1007,89 @@ mod tests {
             screen_key(&with_pci),
             Some(ScreenKey { pci: "0000:00:02.0".to_string(), connector: "HDMI-A-2".to_string() })
         );
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|name| name.to_string()).collect()
+    }
+
+    #[test]
+    fn screen_rows_run_left_to_right_then_unplaced_in_default_order() {
+        // Default (snapshot) order is not left to right.
+        let mut failed = output("card0-DP-1", "0000:00:02.0");
+        failed.status = "failed: no mode".to_string();
+        let snap = snapshot(vec![
+            placed("card0-eDP-1", "0000:00:02.0", 3840, false),
+            failed,
+            placed("card1-HDMI-A-1", "0000:01:00.0", 0, true),
+            peer_pending("card1-DP-3", "0000:01:00.0"),
+            placed("card0-HDMI-A-2", "0000:00:02.0", 1920, false),
+        ]);
+        let (rows, placed_count) = screen_rows(&snap);
+        let row_names: Vec<&str> = rows.iter().map(|&i| snap.outputs[i].name.as_str()).collect();
+        assert_eq!(
+            row_names,
+            ["card1-HDMI-A-1", "card0-HDMI-A-2", "card0-eDP-1", "card0-DP-1", "card1-DP-3"]
+        );
+        assert_eq!(placed_count, 3);
+        assert_eq!(screen_rows(&snapshot(Vec::new())), (Vec::new(), 0));
+    }
+
+    #[test]
+    fn neighbour_swap_moves_one_place_and_refuses_the_ends() {
+        let order = names(&["A", "B", "C"]);
+        assert_eq!(swap_neighbour(&order, 1, -1), Some(names(&["B", "A", "C"])));
+        assert_eq!(swap_neighbour(&order, 1, 1), Some(names(&["A", "C", "B"])));
+        assert_eq!(swap_neighbour(&order, 0, -1), None);
+        assert_eq!(swap_neighbour(&order, 2, 1), None);
+        assert_eq!(swap_neighbour(&order, 3, -1), None);
+        assert_eq!(swap_neighbour(&names(&["A"]), 0, 1), None);
+    }
+
+    #[test]
+    fn fill_slots_keeps_the_others_where_they_were() {
+        // The platform order with an unplaced saved screen (X) between two
+        // placed ones and an unlisted one at the end.
+        let full = names(&["A", "X", "B", "C", "Z"]);
+        assert_eq!(fill_slots(&full, &names(&["B", "A", "C"])), names(&["B", "X", "A", "C", "Z"]));
+        // Unknown names in the new order are ignored.
+        assert_eq!(fill_slots(&full, &names(&["C", "Q", "B", "A"])), names(&["C", "X", "B", "A", "Z"]));
+    }
+
+    #[test]
+    fn reorder_puts_the_given_keys_in_their_slots() {
+        let mut l = DisplayLayout::parse(
+            "screen 0000:00:02.0 HDMI-A-2 mode=3840x2160@30\nscreen 0000:01:00.0 DP-3 main\nscreen 0000:01:00.0 HDMI-A-1\n",
+        );
+        l.reorder(&[key("0000:01:00.0", "HDMI-A-1"), key("0000:00:02.0", "HDMI-A-2"), key("0000:09:00.0", "DP-1")]);
+        let order: Vec<&str> = l.screens.iter().map(|e| e.key.connector.as_str()).collect();
+        assert_eq!(order, ["HDMI-A-1", "DP-3", "HDMI-A-2"]);
+        assert_eq!(l.screens[2].mode, Some("3840x2160@30".to_string()));
+        assert!(l.screens[1].main);
+    }
+
+    #[test]
+    fn screens_span_gpus_counts_placed_and_joining_screens() {
+        let one_gpu = snapshot(vec![
+            placed("card0-eDP-1", "0000:00:02.0", 0, true),
+            placed("card0-HDMI-A-2", "0000:00:02.0", 1920, false),
+        ]);
+        assert!(!screens_span_gpus(&one_gpu));
+        let mut failed = output("card1-DP-1", "0000:01:00.0");
+        failed.card = "card1".to_string();
+        failed.status = "failed: no mode".to_string();
+        let mut with_failed = one_gpu.clone();
+        with_failed.outputs.push(failed);
+        assert!(!screens_span_gpus(&with_failed));
+        let mut with_peer = one_gpu.clone();
+        let mut peer = peer_pending("card1-HDMI-A-1", "0000:01:00.0");
+        peer.card = "card1".to_string();
+        with_peer.outputs.push(peer);
+        assert!(screens_span_gpus(&with_peer));
+        let mut two_placed = one_gpu;
+        let mut other = placed("card1-HDMI-A-1", "0000:01:00.0", 3840, false);
+        other.card = "card1".to_string();
+        two_placed.outputs.push(other);
+        assert!(screens_span_gpus(&two_placed));
     }
 }

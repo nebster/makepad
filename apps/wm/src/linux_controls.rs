@@ -34,7 +34,8 @@ use makepad_widgets::makepad_platform::linux_input::{
 };
 use makepad_widgets::makepad_platform::linux_display::LinuxDisplaySnapshot;
 use shell::display_layout::{
-    is_joining, restore_plan, restore_waiting, screen_key, DisplayLayout, RestoreOp, ScreenEntry,
+    fill_slots, is_joining, restore_plan, restore_waiting, screen_key, screen_rows, screens_span_gpus,
+    DisplayLayout, RestoreOp, ScreenEntry, ScreenKey,
 };
 use shell::panels::{PanelKind, ShellPanel};
 use shell::system_linux::{
@@ -61,9 +62,18 @@ pub enum ControlAction {
     /// The "Optimize for" output: a connector name from the renderer's
     /// inventory, whose native pixels define the shared framebuffer.
     DisplaySource(String),
-    /// Live compositor GPU: `Some(identity)` as `GpuInfo::identity` gives
-    /// it, `None` for the display GPU. Applied now; persisted only after
-    /// the switch is accepted and finishes.
+    /// The screens of the desktop in this new left-to-right order
+    /// (connector names, a neighbour swap of the drawn order): applied
+    /// through `linux_set_display_order` and saved.
+    DisplayOrder(Vec<String>),
+    /// Show screen `name` in `mode` (the renderer's mode syntax), or its
+    /// fastest native mode with `None`: applied live and saved.
+    DisplayMode { name: String, mode: Option<String> },
+    /// Render-on GPU: `Some(identity)` as `GpuInfo::identity` gives it,
+    /// `None` for Auto (the display GPU). While the screens span GPUs the
+    /// renderer cannot switch live, so it is only saved for the next
+    /// start; otherwise it is applied now and saved once the switch
+    /// finishes.
     GpuChoice(Option<String>),
     /// Live per-app GPU for this running client: `None` follows the
     /// compositor. Not persisted.
@@ -71,6 +81,9 @@ pub enum ControlAction {
     /// Pointer speed in hundredths (100 = 1.00×). Applied on every update;
     /// `touchpad` selects the device (`false` mouse, `true` touchpad).
     PointerSpeed { touchpad: bool, value: u32 },
+    /// "Restart desktop now", confirmed: restart the WM so the session
+    /// script applies the saved render-on GPU (apps close).
+    RestartDesktop,
     Command(SystemCommand),
 }
 
@@ -407,11 +420,39 @@ impl App {
                 self.redraw_all(cx);
                 return;
             }
+            ControlAction::DisplayOrder(order) => {
+                self.linux_controls.notice.clear();
+                self.apply_display_order(cx, order);
+                self.poll_linux_controls(cx);
+                self.redraw_all(cx);
+                return;
+            }
+            ControlAction::DisplayMode { name, mode } => {
+                self.linux_controls.notice.clear();
+                self.apply_display_mode(cx, &name, mode);
+                self.poll_linux_controls(cx);
+                self.redraw_all(cx);
+                return;
+            }
+            ControlAction::RestartDesktop => {
+                // The restart itself (exit 75, which the service restarts)
+                // comes with the restart task; until then the request is
+                // only logged.
+                log!("wm: restart desktop requested (not wired yet)");
+                return;
+            }
             ControlAction::GpuChoice(choice) => {
                 self.linux_controls.notice.clear();
                 let invalid = choice.as_deref().and_then(|identity| validate_gpu_choice(identity).err());
                 if let Some(message) = invalid {
                     self.linux_controls.notice = format!("Render on: {message}");
+                } else if screens_span_gpus(&cx.linux_display_snapshot()) {
+                    // The renderer cannot switch while screens on other GPUs
+                    // are part of the desktop: the choice is for the next
+                    // start ("Restart desktop now" applies it).
+                    log!("wm: render on {} saved for the next start", choice.as_deref().unwrap_or("auto"));
+                    self.linux_controls.gpu_user_set = true;
+                    self.linux_controls.edit_layout(None, |layout| layout.render_on = choice);
                 } else {
                     match self.resolve_compositor_uuid(cx, choice.as_deref()) {
                         Err(message) => self.linux_controls.notice = format!("Render on: {message}"),
@@ -480,6 +521,9 @@ impl App {
                 ControlAction::Brightness(value) => { controller.set_brightness(value.max(1)); }
                 ControlAction::DpiScale(_)
                 | ControlAction::DisplaySource(_)
+                | ControlAction::DisplayOrder(_)
+                | ControlAction::DisplayMode { .. }
+                | ControlAction::RestartDesktop
                 | ControlAction::GpuChoice(_)
                 | ControlAction::AppGpuChoice { .. }
                 | ControlAction::PointerSpeed { .. } => {}
@@ -704,6 +748,17 @@ impl App {
                 state.notice = notice;
             }
             panel.system_notice = state.notice.clone();
+            // The saved render-on GPU as this session last set it, else as
+            // the worker read it.
+            let render_on = match (state.layout.as_ref(), snapshot.as_ref()) {
+                (Some(layout), _) => layout.render_on.clone(),
+                (None, Some(snapshot)) => snapshot.display_layout.render_on.clone(),
+                (None, None) => None,
+            };
+            if panel.render_on_saved != render_on {
+                panel.render_on_saved = render_on;
+                changed = true;
+            }
             if let Some(snapshot) = snapshot {
                 let audio = &snapshot.audio;
                 self.bar_sample.volume = audio.default_output().map(|d| d.percent);
@@ -724,6 +779,68 @@ impl App {
         }
         if changed { self.update_bar(cx); }
         self.reanchor_shell_panel(cx);
+    }
+
+    /// A new left-to-right order from the panel: a permutation of the
+    /// screens in the desktop now (else the inventory changed under the
+    /// click and nothing happens). The renderer gets the whole order, the
+    /// screens outside the desktop keeping their places; the layout keeps
+    /// its other saved screens where they were.
+    fn apply_display_order(&mut self, cx: &mut Cx, order: Vec<String>) {
+        let displays = cx.linux_display_snapshot();
+        let (rows, placed) = screen_rows(&displays);
+        let mut now: Vec<&str> = rows[..placed].iter().map(|&i| displays.outputs[i].name.as_str()).collect();
+        let mut asked: Vec<&str> = order.iter().map(String::as_str).collect();
+        now.sort_unstable();
+        asked.sort_unstable();
+        if now != asked || order.len() < 2 {
+            log!("wm: display order {} not applied: the screens changed", order.join(","));
+            return;
+        }
+        let mut layout = self.linux_controls.layout.clone().unwrap_or_default();
+        layout.include_snapshot(&displays);
+        let full = fill_slots(&layout.order_names(&displays), &order);
+        match cx.linux_set_display_order(&full) {
+            Ok(()) => {
+                log!("wm: display order {}", full.join(","));
+                self.linux_controls.layout_set_by_person();
+                let keys: Vec<ScreenKey> = order
+                    .iter()
+                    .filter_map(|name| displays.outputs.iter().find(|o| o.name == *name).and_then(screen_key))
+                    .collect();
+                self.linux_controls.edit_layout(Some(&displays), |layout| layout.reorder(&keys));
+            }
+            Err(message) => {
+                self.linux_controls.notice = format!("Arrange screens: {message}");
+                log!("wm: display order refused: {message}");
+            }
+        }
+    }
+
+    /// A screen's mode from the panel: applied live (the screen is
+    /// reacquired) and saved as that screen's `mode=`, or cleared for
+    /// Automatic.
+    fn apply_display_mode(&mut self, cx: &mut Cx, name: &str, mode: Option<String>) {
+        match cx.linux_set_display_mode(name, mode.as_deref()) {
+            Ok(()) => {
+                log!("wm: display mode {} for {name}", mode.as_deref().unwrap_or("automatic"));
+                self.linux_controls.layout_set_by_person();
+                let displays = cx.linux_display_snapshot();
+                match displays.outputs.iter().find(|o| o.name == name).and_then(screen_key) {
+                    Some(key) => self.linux_controls.edit_layout(Some(&displays), |layout| {
+                        if !layout.screens.iter().any(|entry| entry.key == key) {
+                            layout.screens.push(ScreenEntry { key: key.clone(), main: false, mode: None });
+                        }
+                        layout.set_mode(&key, mode);
+                    }),
+                    None => log!("wm: mode for {name} not saved: its card has no PCI address"),
+                }
+            }
+            Err(message) => {
+                self.linux_controls.notice = format!("Mode for {name}: {message}");
+                log!("wm: display mode for {name} refused: {message}");
+            }
+        }
     }
 
     /// The start-up restore of the saved layout, against this poll's
