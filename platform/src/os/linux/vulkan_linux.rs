@@ -1116,8 +1116,9 @@ pub(super) struct PeerDisplay {
     resend: bool,
     failure: Option<String>,
     retry_at: Option<Instant>,
-    /// The last per-tick error logged and when, to rate-limit repeats.
-    last_log: Option<(String, Instant)>,
+    /// Per error kind ("reconcile", "presentation", "transfer"): the last
+    /// message logged and when, so each kind is rate-limited on its own.
+    last_log: HashMap<&'static str, (String, Instant)>,
 }
 
 /// A layout the rendering GPU imposes on a peer: the peer's composition size
@@ -4160,7 +4161,7 @@ impl CxVulkan {
                         resend: false,
                         failure: None,
                         retry_at: None,
-                        last_log: None,
+                        last_log: HashMap::new(),
                     });
                     added = true;
                 }
@@ -4194,7 +4195,7 @@ impl CxVulkan {
         let mut changed = false;
         for peer in &mut peers {
             if let Err(error) = peer.display.direct_reconcile_outputs() {
-                Self::direct_peer_log(peer, format!("reconcile failed: {error}"));
+                Self::direct_peer_log(peer, "reconcile", format!("reconcile failed: {error}"));
             }
             let generation = peer.display.direct_layout_generation();
             if generation != peer.seen_generation {
@@ -4220,7 +4221,7 @@ impl CxVulkan {
         let mut changed = false;
         for peer in &mut peers {
             if let Err(error) = peer.display.direct_reconcile_outputs() {
-                Self::direct_peer_log(peer, format!("reconcile failed: {error}"));
+                Self::direct_peer_log(peer, "reconcile", format!("reconcile failed: {error}"));
             }
             let generation = peer.display.direct_layout_generation();
             if generation != peer.seen_generation {
@@ -4241,16 +4242,17 @@ impl CxVulkan {
         }
     }
 
-    /// Logs a per-tick peer error when its text changes, otherwise at most
-    /// once per `PEER_LOG_INTERVAL`.
-    fn direct_peer_log(peer: &mut PeerDisplay, message: String) {
+    /// Logs a per-tick peer error of `kind` when its text changes, otherwise
+    /// at most once per `PEER_LOG_INTERVAL`. Each kind has its own limit, so
+    /// two errors that alternate every tick do not defeat it.
+    fn direct_peer_log(peer: &mut PeerDisplay, kind: &'static str, message: String) {
         let now = Instant::now();
-        let repeat = peer.last_log.as_ref().is_some_and(|(last, at)| {
+        let repeat = peer.last_log.get(kind).is_some_and(|(last, at)| {
             *last == message && now.duration_since(*at) < PEER_LOG_INTERVAL
         });
         if !repeat {
             crate::error!("Vulkan direct: {} {message}", peer.card.display());
-            peer.last_log = Some((message, now));
+            peer.last_log.insert(kind, (message, now));
         }
     }
 
@@ -4301,6 +4303,7 @@ impl CxVulkan {
     fn direct_peer_failed(peer: &mut PeerDisplay, error: String) {
         Self::direct_peer_log(
             peer,
+            "transfer",
             format!("transfer failed ({error}); its screens keep the last frame and retry"),
         );
         peer.failure = Some(error);
@@ -4378,7 +4381,7 @@ impl CxVulkan {
             }
         }
         if let Err(error) = peer.display.direct_present_retained() {
-            Self::direct_peer_log(peer, format!("presentation failed: {error}"));
+            Self::direct_peer_log(peer, "presentation", format!("presentation failed: {error}"));
         }
     }
 
