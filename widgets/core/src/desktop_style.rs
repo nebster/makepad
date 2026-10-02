@@ -62,7 +62,7 @@ impl DesktopStyle {
     }
     pub fn label(self) -> &'static str {
         match self {
-            Self::Omarchy => "Omarchy",
+            Self::Omarchy => "Hyprland",
             Self::BlackOrange => "Black orange",
             Self::Macos => "macOS",
             Self::Windows => "Windows",
@@ -201,7 +201,7 @@ macro_rules! sheet_entry {
 /// The library's own sheets: the desktop families', each followed by its
 /// dark appearance where it has one.
 static DESKTOP_SHEETS: [SheetEntry; 12] = [
-    sheet_entry!(dir: "../themes", id: "omarchy", label: "Omarchy", family: DesktopStyle::Omarchy, dark: None, resources: crate::widgets_dir),
+    sheet_entry!(dir: "../themes", id: "omarchy", label: "Hyprland", family: DesktopStyle::Omarchy, dark: None, resources: crate::widgets_dir),
     sheet_entry!(dir: "../themes", id: "black-orange", label: "Black orange", family: DesktopStyle::BlackOrange, dark: None, resources: crate::widgets_dir),
     sheet_entry!(dir: "../themes", id: "macos", label: "macOS", family: DesktopStyle::Macos, dark: Some("macos-dark"), resources: crate::widgets_dir),
     sheet_entry!(dir: "../themes", id: "macos-dark", label: "macOS dark", family: DesktopStyle::Macos, dark: None, resources: crate::widgets_dir),
