@@ -66,19 +66,24 @@ impl crate::cx::Cx {
             .unwrap_or_default()
     }
 
-    /// Ask the renderer to render natively for the named output ("optimize
-    /// for"): its native mode becomes the composition resolution and every
-    /// other output clones that frame through the GPU blit. `name` is an
-    /// `outputs[].name` from the snapshot.
+    /// Ask the renderer to make the named output the main screen ("optimize
+    /// for"): its native mode becomes the composition resolution. `name` is
+    /// an `outputs[].name` from the snapshot and may be a screen on any GPU
+    /// of the wide desktop, not only the rendering GPU's own. When it is an
+    /// active screen of the rendering GPU, that output also becomes the one
+    /// that paces frames; choosing a peer's screen moves the main screen
+    /// there without changing which output paces frames.
     ///
     /// `Ok` means the request was accepted and queued, not applied: the
     /// renderer switches at its next safe frame boundary (no mode setting or
     /// GPU waits happen inside the caller's event handler). Once applied, the
-    /// snapshot marks that output `primary`, the main window's geometry
-    /// changes through the ordinary `WindowGeomChange` event at the same
-    /// effective DPI, and the preferred name is kept so the output is chosen
-    /// again after a reconnect. `Err` reports why the output is not eligible
-    /// (not connected, on another GPU, or currently failed).
+    /// snapshot marks that output `primary` (immediately once the output is
+    /// active, ahead of any composition resize the switch needs), the main
+    /// window's geometry changes through the ordinary `WindowGeomChange`
+    /// event at the same effective DPI, and the preferred name is kept so
+    /// the output is chosen again after a reconnect. `Err` reports why the
+    /// output is not eligible (not connected, on another GPU, or currently
+    /// failed).
     pub fn linux_set_display_source(&mut self, name: &str) -> Result<(), String> {
         let vulkan = self
             .os
