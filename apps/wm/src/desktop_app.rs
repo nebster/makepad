@@ -169,7 +169,7 @@ impl App {
                 .and_then(|bar| bar.hit_rect(&crate::mobile::PhoneHit::Style))
         } else {
             self.ui.widget(cx, ids!(shell_bar)).borrow::<crate::shell::bar::ShellBar>()
-                .and_then(|bar| bar.module_rect(BarModule::Style))
+                .and_then(|bar| bar.module_rect(self.bar_press_segment, BarModule::Style))
         };
         self.open_shell_menu(cx, "desktop", MenuSkin::Menu);
         let active = format!("desktop.{}", self.current_desktop_sheet().id);

@@ -536,6 +536,13 @@ pub struct App {
     /// Which bar module's flyout is open, for the accent pill.
     #[rust]
     shell_panel_open: Option<BarModule>,
+    /// The bar segment that flyout was opened from: its pill and anchor.
+    #[rust]
+    shell_panel_segment: usize,
+    /// The bar segment the last press landed in: the style menu anchors
+    /// to that segment's switch.
+    #[rust]
+    bar_press_segment: usize,
     /// The Wi-Fi dropdown's iwd link (Linux, shell/wifi_linux.rs): started
     /// when the dropdown first opens, alive for the session, dropped at
     /// shutdown.
@@ -594,10 +601,11 @@ pub struct App {
     /// Android super-app: compiled `dylib`s kept mapped for the session.
     #[rust]
     dylib_host: Option<DylibHost>,
-    /// The workspaces the bar cluster is currently showing, left to right —
-    /// what a click on it maps to.
+    /// The workspaces each bar segment's cluster is currently showing,
+    /// left to right — what a click on it maps to (one entry on a
+    /// one-segment bar).
     #[rust]
-    bar_workspaces: Vec<usize>,
+    bar_workspaces: Vec<Vec<usize>>,
     /// Quick Look's warm-viewer cache (see `preview::PreviewCache`).
     #[rust]
     preview_cache: PreviewCache,
@@ -3325,7 +3333,7 @@ impl App {
     fn shell_menu_activate(&mut self, cx: &mut Cx, target: &str) {
         log!("wm: shell menu activate {target}");
         if target=="start.documents" {self.launch_app(cx,"files");return;}
-        if target=="start.power" {self.toggle_shell_panel(cx,BarModule::Power);return;}
+        if target=="start.power" {let seg=self.active_bar_segment();self.toggle_shell_panel(cx,seg,BarModule::Power);return;}
         if let Some(name) = target.strip_prefix("desktop.") {
             if let Some(entry) = desktop_style::find(name) {
                 // The appearance toggle owns dark or light; a style pick
@@ -3388,7 +3396,9 @@ impl App {
     }
 
     /// Toggle a bar module's flyout, anchored to the module itself.
-    fn toggle_shell_panel(&mut self, cx: &mut Cx, module: BarModule) {
+    /// `seg` is the bar segment it was pressed in, so the flyout opens on
+    /// that screen.
+    fn toggle_shell_panel(&mut self, cx: &mut Cx, seg: usize, module: BarModule) {
         let Some(kind) = shell::panels::PanelKind::for_module(module) else {
             return;
         };
@@ -3397,9 +3407,10 @@ impl App {
             let borrowed = bar.borrow::<shell::bar::ShellBar>();
             borrowed
                 .as_ref()
-                .and_then(|b| b.module_rect(module))
+                .and_then(|b| b.module_rect(seg, module))
                 .unwrap_or_default()
         };
+        self.shell_panel_segment = seg;
         let panel = self.ui.widget(cx, ids!(shell_panel));
         let mut opened_network = false;
         {
@@ -3484,48 +3495,53 @@ impl App {
         if let Some(clock)=self.bar_sample.clock.split_whitespace().find(|s|s.contains(':')).map(str::to_string) {
             self.state_mut().phone.clock=clock;
         }
-        let mut shown: Vec<usize> = Vec::new();
-        let workspaces = {
+        // One segment per live screen on a multi-screen desktop, else the
+        // one bar for the active screen, as always.
+        let segmented = self.bar_segmented();
+        let (active, screens): (usize, Vec<usize>) = {
+            let screens = &self.state_mut().screens;
+            let list = if segmented { (0..screens.live_count()).collect() } else { vec![screens.active] };
+            (screens.active, list)
+        };
+        let mut shown: Vec<Vec<usize>> = Vec::with_capacity(screens.len());
+        let mut parts: Vec<(Vec<shell::bar::WorkspaceCell>, Option<String>, LRect, bool)> = Vec::new();
+        {
             let state = self.state_mut();
-            let active = state.layout().active;
-            let mut cells: Vec<shell::bar::WorkspaceCell> = Vec::new();
-            // Omarchy's bar: the active workspace is a dot, other POPULATED
-            // ones show their number, empty ones are hidden.
-            for i in 0..layout::WORKSPACES {
-                let populated = !state.layout().clients_on(i).is_empty();
-                if i != active && !populated {
-                    continue;
-                }
-                shown.push(i);
-                cells.push(shell::bar::WorkspaceCell {
-                    label: format!("{}", (i + 1) % 10),
-                    occupied: populated,
-                    focused: i == active,
-                });
+            for &i in &screens {
+                let layout = state.layout_at(i);
+                let (cells, cell_ws) = shell::bar::workspace_cells(layout);
+                let title = layout
+                    .focused_client()
+                    .and_then(|c| state.clients.get(&c))
+                    .map(|s| s.display_title().to_string())
+                    .filter(|t| !t.is_empty());
+                shown.push(cell_ws);
+                parts.push((cells, title, state.screens.screens[i].rect, i == active));
             }
-            cells
-        };
+        }
         self.bar_workspaces = shown;
-        let title = {
-            let state = self.state_mut();
-            state
-                .layout()
-                .focused_client()
-                .and_then(|c| state.clients.get(&c))
-                .map(|s| s.display_title().to_string())
-                .unwrap_or_default()
-        };
-        let mut data = self.bar_sample.clone();
-        data.workspaces = workspaces;
-        data.style = self.state_mut().style.target;
-        data.dark = self.state_mut().style.dark;
-        data.active_window = (!title.is_empty()).then_some(title);
-        data.open_panel = self.shell_panel_open;
+        let mut base = self.bar_sample.clone();
+        base.style = self.state_mut().style.target;
+        base.dark = self.state_mut().style.dark;
         // The middle window control reads "restore" while maximized.
-        data.maximized = self.ui.window(cx, ids!(main_window)).is_fullscreen(cx);
+        base.maximized = self.ui.window(cx, ids!(main_window)).is_fullscreen(cx);
+        let mut segments: Vec<shell::bar::BarSegment> = Vec::new();
+        let mut data = base.clone();
+        for (seg, (cells, title, rect, is_active)) in parts.into_iter().enumerate() {
+            let mut d = base.clone();
+            d.workspaces = cells;
+            d.active_window = title;
+            d.open_panel = if !segmented || seg == self.shell_panel_segment { self.shell_panel_open } else { None };
+            if is_active {
+                data = d.clone();
+            }
+            if segmented {
+                segments.push(shell::bar::BarSegment { x0: rect.x, x1: rect.x + rect.w, data: d, active: is_active });
+            }
+        }
         let window_controls = shell::bar::window_controls_default()
             && !matches!(cx.os_type(), OsType::LinuxDirect);
-        let shown = format!("{:?} {}", data, window_controls);
+        let shown = format!("{:?} {:?} {}", data, segments, window_controls);
         if shown == self.bar_shown {
             return;
         }
@@ -3535,11 +3551,84 @@ impl App {
             let mut borrowed = bar.borrow_mut::<shell::bar::ShellBar>();
             if let Some(b) = borrowed.as_mut() {
                 b.data = data;
+                b.segments = segments;
                 // The direct-display session has no outer window to control.
                 b.window_controls = window_controls;
             }
         }
         self.redraw_all(cx);
+    }
+
+    /// Whether the bar draws one segment per live screen: two or more of
+    /// them in a desktop style (a mobile style shows the active screen's
+    /// layout only, and its own bar).
+    fn bar_segmented(&self) -> bool {
+        self.state
+            .as_ref()
+            .is_some_and(|s| s.screens.live_count() >= 2 && !s.style.target.mobile())
+    }
+
+    /// The screen bar segment `seg` stands for: live screen `seg` on a
+    /// segmented bar, the active screen on the one-segment bar (or for a
+    /// segment that no longer exists).
+    fn bar_screen(&self, seg: usize) -> usize {
+        let Some(state) = self.state.as_ref() else { return 0 };
+        if self.bar_segmented() && seg < state.screens.live_count() {
+            seg
+        } else {
+            state.screens.active
+        }
+    }
+
+    /// The bar segment that shows the active screen.
+    fn active_bar_segment(&self) -> usize {
+        match self.state.as_ref() {
+            Some(state) if self.bar_segmented() => state.screens.active,
+            _ => 0,
+        }
+    }
+
+    /// The focused window of bar segment `seg`'s screen (its title).
+    fn bar_focused_client(&mut self, seg: usize) -> Option<ClientId> {
+        let screen = self.bar_screen(seg);
+        self.state_mut().layout_at(screen).focused_client()
+    }
+
+    /// A click on workspace cell `i` of bar segment `seg`: that segment's
+    /// screen becomes active, then switches to the workspace. When the
+    /// switch leaves the new screen without a window to focus, the
+    /// keyboard leaves the old screen's window too.
+    fn bar_workspace(&mut self, cx: &mut Cx, seg: usize, i: usize) {
+        let ws = self.bar_workspaces.get(seg).and_then(|v| v.get(i)).copied().unwrap_or(i);
+        let screen = self.bar_screen(seg);
+        let old = self.state_mut().screens.active;
+        self.state_mut().screens.active = screen;
+        self.do_action(cx, WmAction::Workspace(ws));
+        if screen != old && self.state_mut().layout().focused_client().is_none() {
+            self.release_screen_keyboard(cx, old);
+        }
+    }
+
+    /// The active screen changed to one with no window to focus: like
+    /// Hyprland's empty monitor, the keyboard leaves screen `old`'s focused
+    /// window (keys go nowhere rather than to a window on another screen),
+    /// and no focus stays pending. The AI pane keeps the keyboard it holds.
+    fn release_screen_keyboard(&mut self, cx: &mut Cx, old: usize) {
+        if self.ai_pane_is_open(cx) {
+            return;
+        }
+        self.pending_focus = None;
+        let client = self
+            .state
+            .as_ref()
+            .filter(|s| old < s.screens.screens.len())
+            .and_then(|s| s.layout_at(old).focused_client());
+        if let Some(client) = client {
+            let _ = self
+                .desk(cx)
+                .borrow_mut::<WmDesk>()
+                .and_then(|mut d| d.with_tile(cx, client, |cx, v| v.release_keyboard(cx)));
+        }
     }
 
     /// The bar's window controls: the same three calls the stock caption
@@ -3795,6 +3884,7 @@ impl App {
     /// screen's focused window the keyboard, unless the AI pane holds it.
     /// Hover within a screen never changes focus.
     fn pointer_screen(&mut self, cx: &mut Cx, abs: Vec2d) {
+        let old = self.state_mut().screens.active;
         let Some(i) = self.state_mut().screens.on_pointer(abs.x, abs.y) else {
             return;
         };
@@ -3803,6 +3893,9 @@ impl App {
                 // May return early (a no-focus preview): the bar below
                 // follows the new screen either way.
                 self.focus_client(cx, c);
+            } else {
+                // An empty screen: the keyboard leaves the old one's window.
+                self.release_screen_keyboard(cx, old);
             }
         }
         self.update_bar(cx);
@@ -5009,16 +5102,16 @@ impl MatchEvent for App {
             // The shell surfaces: the bar's presses and wheel, the menu's
             // activations, the flyouts' controls.
             match wa.cast::<ShellBarAction>() {
-                ShellBarAction::Press(module) => match module {
+                ShellBarAction::Press(seg, module) => match module {
                     BarModule::Appearance => self.toggle_desktop_appearance(cx),
-                    BarModule::Style => self.open_style_menu(cx),
-                    BarModule::Menu => self.toggle_launcher(cx),
-                    BarModule::Workspace(i) => {
-                        let ws = self.bar_workspaces.get(i).copied().unwrap_or(i);
-                        self.do_action(cx, WmAction::Workspace(ws));
+                    BarModule::Style => {
+                        self.bar_press_segment = seg;
+                        self.open_style_menu(cx)
                     }
+                    BarModule::Menu => self.toggle_launcher(cx),
+                    BarModule::Workspace(i) => self.bar_workspace(cx, seg, i),
                     BarModule::ActiveWindow => {
-                        if let Some(focus) = self.state_mut().layout().focused_client() {
+                        if let Some(focus) = self.bar_focused_client(seg) {
                             self.focus_client(cx, focus);
                         }
                     }
@@ -5030,15 +5123,18 @@ impl MatchEvent for App {
                             self.window_control(cx, control);
                         }
                     }
-                    other => self.toggle_shell_panel(cx, other),
+                    other => self.toggle_shell_panel(cx, seg, other),
                 },
-                ShellBarAction::RightPress(module) => match module {
+                ShellBarAction::RightPress(seg, module) => match module {
                     // The Omarchy button's right click opens a terminal.
                     BarModule::Appearance => self.toggle_desktop_appearance(cx),
-                    BarModule::Style => self.open_style_menu(cx),
+                    BarModule::Style => {
+                        self.bar_press_segment = seg;
+                        self.open_style_menu(cx)
+                    }
                     BarModule::Menu => self.do_action(cx, WmAction::LaunchTerminal),
                     BarModule::ActiveWindow => {
-                        if let Some(focus) = self.state_mut().layout().focused_client() {
+                        if let Some(focus) = self.bar_focused_client(seg) {
                             self.request_close(cx, focus);
                         }
                     }
@@ -5052,12 +5148,12 @@ impl MatchEvent for App {
                     }
                     _ => {}
                 },
-                ShellBarAction::MiddlePress(module) => {
+                ShellBarAction::MiddlePress(seg, module) => {
                     // `ActiveWindow.qml`: middle click closes the focused
                     // window exactly like a right click — every other
                     // module ignores the middle button.
                     if module == BarModule::ActiveWindow {
-                        if let Some(focus) = self.state_mut().layout().focused_client() {
+                        if let Some(focus) = self.bar_focused_client(seg) {
                             self.request_close(cx, focus);
                         }
                     }
@@ -5335,9 +5431,11 @@ impl AppMain for App {
         }
         if self.state.is_some() && !self.state_mut().style.target.mobile() {
             if let Event::MouseDown(e)=event {
-                let module=self.ui.widget(cx,ids!(shell_bar)).borrow::<shell::bar::ShellBar>().and_then(|b|b.module_at(e.abs));
+                let hit=self.ui.widget(cx,ids!(shell_bar)).borrow::<shell::bar::ShellBar>().and_then(|b|b.hit_at(e.abs));
+                let module=hit.map(|(_,m)|m);
                 if module==Some(BarModule::Appearance) {self.toggle_desktop_appearance(cx);return;}
-                if module==Some(BarModule::Style) {
+                if let Some((seg,BarModule::Style))=hit {
+                    self.bar_press_segment=seg;
                     self.open_style_menu(cx);
                     return;
                 }
