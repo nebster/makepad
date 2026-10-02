@@ -206,6 +206,74 @@ impl LinuxControls {
         take_layout_save(self.layout_loaded, &mut self.layout_save)
     }
 
+    /// One poll of the start-up order/mode restore: the requests to send
+    /// now. On each new display generation whose desktop is laid out, the
+    /// plan's order and mode requests not sent before go out (one identical
+    /// request is never sent twice, so no rescan loop). The restore ends
+    /// only on a pass where the arrangement can be judged and holds: laid
+    /// out, nothing joining or overlapping (`restore_waiting`), no order or
+    /// mode left in the plan, and settled past the last request (the
+    /// renderer's generation moved and the confirm span passed,
+    /// `main_restore_confirms`), so a mode's reacquire that briefly takes a
+    /// screen out of the desktop cannot end it before the order is checked
+    /// again. Otherwise it gives up `SOURCE_RESTORE_TIMEOUT` after the
+    /// first inventory or the last request, whichever is later.
+    fn order_restore_step(
+        &mut self,
+        layout: &DisplayLayout,
+        displays: &LinuxDisplaySnapshot,
+        generation: u64,
+        now: f64,
+        since: f64,
+    ) -> Vec<RestoreOp> {
+        let mut send = Vec::new();
+        if self.layout_restore_done {
+            return send;
+        }
+        let plan = restore_plan(layout, displays);
+        let waiting = restore_waiting(layout, displays);
+        let laid_out = displays.outputs.iter().any(|o| o.desktop_position.is_some());
+        if self.layout_restore_generation != Some(generation) && laid_out {
+            self.layout_restore_generation = Some(generation);
+            let mut held = Vec::new();
+            for op in &plan {
+                if matches!(op, RestoreOp::Main(_)) {
+                    continue;
+                }
+                if self.layout_restore_sent.contains(op) {
+                    held.push(op);
+                    continue;
+                }
+                self.layout_restore_sent.push(op.clone());
+                self.layout_restore_sent_at = Some((generation, now));
+                send.push(op.clone());
+            }
+            let has_order = plan.iter().any(|op| matches!(op, RestoreOp::Order(_)));
+            log!(
+                "wm: display layout restore, generation {generation}: order {}{}, sending {}, already sent {}",
+                if has_order { "needed" } else { "in place" },
+                if waiting { " (a saved screen is joining or the desktop is settling)" } else { "" },
+                send.len(),
+                held.len()
+            );
+        }
+        let outstanding = plan.iter().any(|op| !matches!(op, RestoreOp::Main(_)));
+        let settled = main_restore_confirms(self.layout_restore_sent_at, generation, now);
+        let last = self.layout_restore_sent_at.map_or(since, |(_, sent)| sent.max(since));
+        if laid_out && !waiting && !outstanding && settled {
+            log!("wm: saved display order and modes are in place");
+            self.layout_restore_done = true;
+        } else if now - last > SOURCE_RESTORE_TIMEOUT {
+            log!(
+                "wm: saved display order/modes not confirmed in time ({}); keeping what is laid out",
+                if !laid_out { "nothing laid out" } else if waiting { "a saved screen did not join" }
+                    else if outstanding { "the arrangement still differs" } else { "not settled" }
+            );
+            self.layout_restore_done = true;
+        }
+        send
+    }
+
     /// The person changed order, main screen or a mode: the start-up
     /// restore is over for this session.
     fn layout_set_by_person(&mut self) {
@@ -446,13 +514,13 @@ impl App {
                 let invalid = choice.as_deref().and_then(|identity| validate_gpu_choice(identity).err());
                 if let Some(message) = invalid {
                     self.linux_controls.notice = format!("Render on: {message}");
-                } else if screens_span_gpus(&cx.linux_display_snapshot()) {
+                } else if let Some(displays) = Some(cx.linux_display_snapshot()).filter(screens_span_gpus) {
                     // The renderer cannot switch while screens on other GPUs
                     // are part of the desktop: the choice is for the next
                     // start ("Restart desktop now" applies it).
                     log!("wm: render on {} saved for the next start", choice.as_deref().unwrap_or("auto"));
                     self.linux_controls.gpu_user_set = true;
-                    self.linux_controls.edit_layout(None, |layout| layout.render_on = choice);
+                    self.linux_controls.edit_layout(Some(&displays), |layout| layout.render_on = choice);
                 } else {
                     match self.resolve_compositor_uuid(cx, choice.as_deref()) {
                         Err(message) => self.linux_controls.notice = format!("Render on: {message}"),
@@ -833,7 +901,7 @@ impl App {
                         }
                         layout.set_mode(&key, mode);
                     }),
-                    None => log!("wm: mode for {name} not saved: its card has no PCI address"),
+                    None => log!("wm: mode for {name} not saved: it is no longer listed or its card has no PCI address"),
                 }
             }
             Err(message) => {
@@ -874,44 +942,24 @@ impl App {
         let timed_out = now - since > SOURCE_RESTORE_TIMEOUT;
         let mut asked = false;
         let generation = cx.linux_display_generation();
-        if !self.linux_controls.layout_restore_done {
-            let laid_out = displays.outputs.iter().any(|o| o.desktop_position.is_some());
-            if self.linux_controls.layout_restore_generation != Some(generation) && laid_out {
-                self.linux_controls.layout_restore_generation = Some(generation);
-                for op in &plan {
-                    if self.linux_controls.layout_restore_sent.contains(op) {
-                        continue;
+        for op in self.linux_controls.order_restore_step(&layout, displays, generation, now, since) {
+            match &op {
+                RestoreOp::Order(order) => {
+                    log!("wm: applying saved display order {}", order.join(","));
+                    if let Err(message) = cx.linux_set_display_order(order) {
+                        log!("wm: saved display order refused: {message}");
                     }
-                    match op {
-                        RestoreOp::Order(order) => {
-                            log!("wm: applying saved display order {}", order.join(","));
-                            if let Err(message) = cx.linux_set_display_order(order) {
-                                log!("wm: saved display order refused: {message}");
-                            }
-                        }
-                        RestoreOp::Mode(name, mode) => {
-                            let label = mode.as_deref().unwrap_or("automatic");
-                            log!("wm: applying saved mode {label} for {name}");
-                            if let Err(message) = cx.linux_set_display_mode(name, mode.as_deref()) {
-                                log!("wm: saved mode {label} for {name} refused: {message}");
-                            }
-                        }
-                        RestoreOp::Main(_) => continue,
-                    }
-                    self.linux_controls.layout_restore_sent.push(op.clone());
-                    self.linux_controls.layout_restore_sent_at = Some((generation, now));
-                    asked = true;
                 }
+                RestoreOp::Mode(name, mode) => {
+                    let label = mode.as_deref().unwrap_or("automatic");
+                    log!("wm: applying saved mode {label} for {name}");
+                    if let Err(message) = cx.linux_set_display_mode(name, mode.as_deref()) {
+                        log!("wm: saved mode {label} for {name} refused: {message}");
+                    }
+                }
+                RestoreOp::Main(_) => {}
             }
-            // Open while a saved screen is still joining (so it is laid
-            // out on its saved side), within the same bound as the main
-            // screen's wait.
-            if laid_out && !restore_waiting(&layout, displays) {
-                self.linux_controls.layout_restore_done = true;
-            } else if timed_out {
-                log!("wm: saved display order: a saved screen did not join in time; keeping what is laid out");
-                self.linux_controls.layout_restore_done = true;
-            }
+            asked = true;
         }
         if !self.linux_controls.source_loaded_applied {
             let request = plan.iter().find_map(|op| match op {
@@ -991,6 +1039,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use makepad_widgets::makepad_platform::linux_display::LinuxDisplayOutput;
 
     fn layout(text: &str) -> DisplayLayout {
         DisplayLayout::parse(text)
@@ -1045,5 +1094,102 @@ mod tests {
         controls.adopt_loaded_layout(&layout("screen 0000:00:02.0 HDMI-A-2\n"));
         assert_eq!(controls.take_layout_save(), None);
         assert_eq!(controls.layout, Some(layout("screen 0000:00:02.0 HDMI-A-2\n")));
+    }
+
+    fn screen(name: &str, pci: &str, position: Option<(u32, u32)>, primary: bool) -> LinuxDisplayOutput {
+        LinuxDisplayOutput {
+            name: name.to_string(),
+            card: name.split('-').next().unwrap_or_default().to_string(),
+            pci: Some(pci.to_string()),
+            width: 3840,
+            height: 2160,
+            desktop_position: position,
+            active: position.is_some(),
+            status: if position.is_some() { "active".to_string() } else { String::new() },
+            primary,
+            ..Default::default()
+        }
+    }
+
+    /// nebmind: the AMD card (0c:00.0) is a peer, the NVIDIA card renders.
+    const NEBMIND_LAYOUT: &str =
+        "screen 0000:0c:00.0 HDMI-A-2 mode=3840x2160@30\nscreen 0000:01:00.0 HDMI-A-1 main\n";
+
+    /// One poll of the order/mode restore against `snap`.
+    fn step(c: &mut LinuxControls, layout: &DisplayLayout, snap: &LinuxDisplaySnapshot, generation: u64, now: f64) -> Vec<RestoreOp> {
+        c.order_restore_step(layout, snap, generation, now, 0.0)
+    }
+
+    fn sent_order(ops: &[RestoreOp]) -> bool {
+        ops.iter().any(|op| matches!(op, RestoreOp::Order(_)))
+    }
+
+    #[test]
+    fn order_restore_outlives_a_mode_reacquire_of_a_peer() {
+        let layout = layout(NEBMIND_LAYOUT);
+        let mut c = LinuxControls::default();
+        let own = screen("card1-HDMI-A-1", "0000:01:00.0", Some((0, 0)), true);
+        // Generation 1: the peer cannot show its fastest mode yet (failed,
+        // not joining), so only its mode is asked for.
+        let mut peer = screen("card0-HDMI-A-2", "0000:0c:00.0", None, false);
+        peer.status = "failed: no free display plane can present the selected mode".to_string();
+        let snap = LinuxDisplaySnapshot { direct: true, outputs: vec![peer.clone(), own.clone()] };
+        let ops = step(&mut c, &layout, &snap, 1, 1.0);
+        assert_eq!(ops, vec![RestoreOp::Mode("card0-HDMI-A-2".to_string(), Some("3840x2160@30".to_string()))]);
+        assert!(!c.layout_restore_done, "done before the mode it asked for was seen");
+        // Generation 2: retired, reacquiring with the new mode.
+        peer.mode_override = Some("3840x2160@30".to_string());
+        peer.status = "retired: reacquiring after hotplug event".to_string();
+        let snap = LinuxDisplaySnapshot { direct: true, outputs: vec![peer.clone(), own.clone()] };
+        // Joining again: the order is seeded so it rejoins on its side.
+        let mut sent = step(&mut c, &layout, &snap, 2, 2.0);
+        assert!(!c.layout_restore_done);
+        // Generation 3: back at 4K30, but on the right.
+        let mut placed_peer = screen("card0-HDMI-A-2", "0000:0c:00.0", Some((3840, 0)), false);
+        placed_peer.mode_override = Some("3840x2160@30".to_string());
+        let snap = LinuxDisplaySnapshot { direct: true, outputs: vec![placed_peer.clone(), own.clone()] };
+        sent.extend(step(&mut c, &layout, &snap, 3, 3.0));
+        assert!(sent_order(&sent), "the order must still be sent: {sent:?}");
+        assert!(!c.layout_restore_done, "the arrangement still differs");
+        // Generation 4: on its saved side; done once settled past the send.
+        placed_peer.desktop_position = Some((0, 0));
+        let mut own_right = own.clone();
+        own_right.desktop_position = Some((3840, 0));
+        let snap = LinuxDisplaySnapshot { direct: true, outputs: vec![placed_peer, own_right] };
+        assert!(step(&mut c, &layout, &snap, 4, 4.0).is_empty());
+        assert!(!c.layout_restore_done, "not settled 1 s after the send");
+        assert!(step(&mut c, &layout, &snap, 4, 9.0).is_empty());
+        assert!(c.layout_restore_done);
+    }
+
+    #[test]
+    fn order_restore_sends_order_after_a_peer_placed_on_top_reacquires() {
+        // Peer placed (at 4K60, still at (0, 0) before its slice) -> mode
+        // sent -> unplaced while reacquiring -> placed again on the right:
+        // the order is still sent and the restore ends only once it holds.
+        let layout = layout(NEBMIND_LAYOUT);
+        let mut c = LinuxControls::default();
+        let own = screen("card1-HDMI-A-1", "0000:01:00.0", Some((0, 0)), true);
+        let mut peer = screen("card0-HDMI-A-2", "0000:0c:00.0", Some((0, 0)), false);
+        let snap = LinuxDisplaySnapshot { direct: true, outputs: vec![peer.clone(), own.clone()] };
+        let ops = step(&mut c, &layout, &snap, 1, 1.0);
+        assert!(ops.contains(&RestoreOp::Mode("card0-HDMI-A-2".to_string(), Some("3840x2160@30".to_string()))));
+        assert!(!c.layout_restore_done);
+        peer.mode_override = Some("3840x2160@30".to_string());
+        peer.desktop_position = None;
+        peer.active = false;
+        peer.status = "retired: reacquiring after hotplug event".to_string();
+        let snap = LinuxDisplaySnapshot { direct: true, outputs: vec![peer.clone(), own.clone()] };
+        step(&mut c, &layout, &snap, 2, 2.0);
+        assert!(!c.layout_restore_done);
+        let mut back = screen("card0-HDMI-A-2", "0000:0c:00.0", Some((3840, 0)), false);
+        back.mode_override = Some("3840x2160@30".to_string());
+        let snap = LinuxDisplaySnapshot { direct: true, outputs: vec![back.clone(), own.clone()] };
+        let mut sent = c.layout_restore_sent.clone();
+        sent.extend(step(&mut c, &layout, &snap, 3, 3.0));
+        assert!(sent_order(&sent), "the order was never sent: {sent:?}");
+        // Still on the wrong side 10 s after the last request: give up.
+        step(&mut c, &layout, &snap, 3, 14.0);
+        assert!(c.layout_restore_done);
     }
 }

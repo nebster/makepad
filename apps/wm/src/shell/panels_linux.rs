@@ -105,6 +105,8 @@ struct MonitorPlan {
     restart_row: bool,
     /// Screen rows shown; the rest scroll.
     rows: usize,
+    /// One row's height: two lines, or one for the "no screens" message.
+    row_h: f64,
     /// Rows of an unfolded mode list, under the screen row it belongs to.
     mode_items: usize,
     /// The "Mouse & touchpad" row, only while the WM drives the outputs.
@@ -125,7 +127,7 @@ fn plan_height(p: &MonitorPlan, notice: bool) -> f64 {
         + if p.pointer_row { SEP_H + p.picker_row } else { 0.0 }
         + SEP_H + HEADER_H
         + if p.picture { DISPLAY_PICTURE_H } else { 0.0 }
-        + p.rows as f64 * SCREEN_ROW_H
+        + p.rows as f64 * p.row_h
         + p.mode_items as f64 * LIST_ITEM_H
         + p.picker_row + if p.app_gpu_row { p.picker_row } else { 0.0 }
         + p.gpu_items as f64 * LIST_ITEM_H
@@ -165,7 +167,7 @@ fn fit_monitor_plan(full: MonitorPlan, notice: bool, avail: f64) -> MonitorPlan 
         let rows_wanted = plan.rows;
         plan.rows = 0;
         let fixed = height(&plan);
-        let fit = ((avail - fixed) / SCREEN_ROW_H).floor().max(0.0) as usize;
+        let fit = ((avail - fixed) / plan.row_h).floor().max(0.0) as usize;
         let floor = if plan.mode_items > 0 || plan.gpu_items == 0 { 1 } else { 0 };
         plan.rows = fit.min(rows_wanted).max(floor.min(rows_wanted));
     }
@@ -266,7 +268,7 @@ impl ShellPanel {
                 // The name drawn on that row, while the renderer still
                 // drives it; the renderer confirms it through `primary`.
                 let name = self.screen_targets.get(row).cloned().filter(|name| {
-                    self.display_snapshot.outputs.iter().any(|o| o.name == *name && o.active)
+                    self.display_snapshot.outputs.iter().any(|o| o.name == *name && o.active && self.in_desktop(o))
                 });
                 self.close_display_lists();
                 if let Some(name) = name {
@@ -302,8 +304,12 @@ impl ShellPanel {
             }
             Hit::RestartCancel => self.restart_confirm = false,
             Hit::RestartConfirm => {
+                // Only while a restart would still change something.
+                let still = self.restart_row_shown();
                 self.close_display_lists();
-                self.system_action(cx, ControlAction::RestartDesktop);
+                if still {
+                    self.system_action(cx, ControlAction::RestartDesktop);
+                }
             }
             Hit::GpuPicker => {
                 let open = !self.gpu_picker;
@@ -483,8 +489,7 @@ impl ShellPanel {
     /// another GPU's screen still to join, …) — never a saved main screen
     /// shown as pending.
     fn screen_status(&self, output: &LinuxDisplayOutput) -> (String, bool) {
-        let in_desktop = output.desktop_position.is_some() || (output.active && !self.any_placed());
-        if in_desktop {
+        if self.in_desktop(output) {
             let pending = self.display_source_pending.as_ref().is_some_and(|(name, _)| *name == output.name);
             if output.primary {
                 ("Main".into(), false)
@@ -498,6 +503,12 @@ impl ShellPanel {
         } else {
             (output.status.clone(), true)
         }
+    }
+
+    /// Part of the desktop: placed, or active while nothing is placed yet.
+    /// An active screen left out by the GPU's limits is not.
+    fn in_desktop(&self, output: &LinuxDisplayOutput) -> bool {
+        output.desktop_position.is_some() || (output.active && !self.any_placed())
     }
 
     fn any_placed(&self) -> bool {
@@ -637,7 +648,7 @@ impl ShellPanel {
                 .iter()
                 .find(|gpu| gpu.matches(identity))
                 .map(|gpu| gpu.label())
-                .unwrap_or_else(|| "a GPU that is not present".into()),
+                .unwrap_or_else(|| "Auto (saved GPU not present)".into()),
         }
     }
 
@@ -663,11 +674,14 @@ impl ShellPanel {
     }
 
     /// "Restart desktop now" is offered: the saved settings have been read
-    /// (an unread file is not "Auto"), the WM drives the screens, and the
-    /// saved render-on GPU is not the running one.
+    /// (an unread file is not "Auto"), the WM drives the screens, the
+    /// saved render-on GPU is present (the next start can only fall back
+    /// to Auto for one that is not, so a restart would change nothing),
+    /// and it is not the running one.
     fn restart_row_shown(&self) -> bool {
         self.display_snapshot.direct
             && self.system.display_settings_loaded
+            && saved_gpu_present(self.render_on_saved.as_deref(), &self.system.gpus)
             && !self.gpu_busy
             && self.system.gpu_env.is_none()
             && self.render_on_differs()
@@ -707,6 +721,7 @@ impl ShellPanel {
             app_gpu_row: self.gpu_app.is_some(),
             restart_row: self.restart_row_shown(),
             rows: self.display_snapshot.outputs.len().clamp(1, SCREEN_ROWS_MAX),
+            row_h: if self.display_snapshot.outputs.is_empty() { SCREEN_LINE_H } else { SCREEN_ROW_H },
             mode_items: self
                 .mode_picker_output()
                 .filter(|o| !o.modes.is_empty())
@@ -1182,8 +1197,8 @@ impl ShellPanel {
             if plan.rows == 0 {
                 return rest;
             }
-            let (row, next) = cut_top(rest, SCREEN_ROW_H);
-            self.unavailable(cx, rect(row.pos.x, row.pos.y, row.size.x, SCREEN_LINE_H), if snapshot.direct { "No connected output" }
+            let (row, next) = cut_top(rest, SCREEN_LINE_H);
+            self.unavailable(cx, row, if snapshot.direct { "No connected output" }
                 else { "The desktop owns the outputs; the scale above still applies" });
             return next;
         }
@@ -1222,7 +1237,7 @@ impl ShellPanel {
         let direct = self.display_snapshot.direct;
         let (line1, line2) = cut_top(area, SCREEN_LINE_H);
         let line2 = rect(line2.pos.x, line2.pos.y, line2.size.x, SCREEN_LINE_H.min(line2.size.y));
-        let in_desktop = output.desktop_position.is_some() || output.active;
+        let in_desktop = self.in_desktop(output);
         let text = if in_desktop { fg } else { dim };
         let icon_w = 22.0;
         self.d.icon_centered(cx, Ico::Monitor, rect(line1.pos.x, line1.pos.y, icon_w, line1.size.y), 14.0, text);
@@ -1259,7 +1274,7 @@ impl ShellPanel {
         if output.primary {
             self.small_button(cx, main, None, true, Some(Ico::Check), "Main");
         } else {
-            let can = direct && output.active;
+            let can = direct && output.active && in_desktop;
             self.small_button(cx, main, can.then_some(Hit::ScreenMain(row)), false, None, "Make main");
         }
         let picker_x = main.pos.x + main_w + gap;
@@ -1424,7 +1439,7 @@ impl ShellPanel {
             text.push_str(&format!(
                 "\nscreen: {row} {} gpu={} status={:?} position={:?} main={} move_left={} move_right={} make_main={} mode={:?} mode_override={:?} modes={}",
                 output.name, self.screen_gpu_label(output), status, output.desktop_position, output.primary, left, right,
-                d.direct && output.active && !output.primary,
+                d.direct && output.active && self.in_desktop(output) && !output.primary,
                 if output.modes.is_empty() { output.mode_override.clone().unwrap_or_else(|| "Automatic".into()) }
                     else { mode_picker_value(&choices, output.mode_override.as_deref()) },
                 output.mode_override, output.modes.len()
@@ -1570,6 +1585,12 @@ fn next_start_differs(saved: Option<&str>, running: Option<&str>, running_is_dis
     }
 }
 
+/// Whether the saved render-on choice can take effect at the next start:
+/// Auto always can; a GPU only while a listed card matches its identity.
+fn saved_gpu_present(saved: Option<&str>, gpus: &[GpuInfo]) -> bool {
+    saved.map_or(true, |identity| gpus.iter().any(|gpu| gpu.matches(identity)))
+}
+
 /// `boxes` (`x, y, w, h` in the desktop's pixels) scaled as one picture
 /// into `width` × `height`, centred: the same scale for every box, so the
 /// arrangement keeps its proportions.
@@ -1649,6 +1670,24 @@ mod tests {
         assert!(!next_start_differs(None, None, None));
     }
 
+    #[test]
+    fn restart_only_for_a_saved_gpu_that_is_present() {
+        let gpu = GpuInfo {
+            card: "card1".into(),
+            pci: "0000:01:00.0".into(),
+            vendor: "10de".into(),
+            device: "2b85".into(),
+            driver: "nvidia".into(),
+            connected: Vec::new(),
+        };
+        assert!(saved_gpu_present(None, &[]));
+        assert!(saved_gpu_present(Some("0000:01:00.0 10de:2b85"), std::slice::from_ref(&gpu)));
+        // Moved card or another model at that address: the next start
+        // falls back to Auto, so a restart would change nothing.
+        assert!(!saved_gpu_present(Some("0000:02:00.0 10de:2b85"), std::slice::from_ref(&gpu)));
+        assert!(!saved_gpu_present(Some("0000:01:00.0 10de:2b84"), &[gpu]));
+    }
+
     fn full_plan() -> MonitorPlan {
         MonitorPlan {
             hero: HERO_H,
@@ -1663,6 +1702,7 @@ mod tests {
             app_gpu_row: true,
             restart_row: true,
             rows: 3,
+            row_h: SCREEN_ROW_H,
             mode_items: 0,
             pointer_row: true,
         }

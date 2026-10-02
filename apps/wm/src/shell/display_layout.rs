@@ -506,6 +506,8 @@ pub fn restore_plan(layout: &DisplayLayout, snap: &LinuxDisplaySnapshot) -> Vec<
             snap.outputs.iter().filter(|output| output.desktop_position.is_some()).collect();
         placed.sort_by_key(|output| output.desktop_position.map(|(x, _)| x).unwrap_or(0));
         let saved: Vec<&str> = resolved.iter().map(|(_, name)| name.as_str()).collect();
+        // Ties (an overlapping, still settling desktop) count as waiting
+        // below, never as "in order".
         let placed_saved: Vec<&str> =
             placed.iter().map(|output| output.name.as_str()).filter(|name| saved.contains(name)).collect();
         let wanted: Vec<&str> =
@@ -554,12 +556,32 @@ pub fn is_joining(output: &LinuxDisplayOutput) -> bool {
         || status.starts_with("active: not in the wide desktop"))
 }
 
-/// Whether a saved screen that resolves this boot is still joining the
-/// desktop ([`is_joining`]): the order restore stays open for it (within
-/// the caller's bound) so it is laid out on its saved side.
+/// Whether the desktop is not settled enough to judge the saved order: a
+/// saved screen that resolves this boot is still joining ([`is_joining`]),
+/// or the placed screens overlap ([`placed_overlap`]). The order restore
+/// stays open (within the caller's bound), and the order is seeded, so the
+/// screen is laid out on its saved side.
 pub fn restore_waiting(layout: &DisplayLayout, snap: &LinuxDisplaySnapshot) -> bool {
-    layout.resolve(snap).iter().any(|(_, name)| {
-        snap.outputs.iter().find(|output| &output.name == name).is_some_and(is_joining)
+    placed_overlap(snap)
+        || layout.resolve(snap).iter().any(|(_, name)| {
+            snap.outputs.iter().find(|output| &output.name == name).is_some_and(is_joining)
+        })
+}
+
+/// Whether two screens of the desktop overlap: a layout still settling
+/// (a peer's screen reported before the wide desktop gave it its slice
+/// sits at its own (0, 0)), which says nothing about the saved order yet.
+pub fn placed_overlap(snap: &LinuxDisplaySnapshot) -> bool {
+    let rects: Vec<(u64, u64, u64, u64)> = snap
+        .outputs
+        .iter()
+        .filter_map(|output| {
+            let (x, y) = output.desktop_position?;
+            Some((x as u64, y as u64, output.width.max(1) as u64, output.height.max(1) as u64))
+        })
+        .collect();
+    rects.iter().enumerate().any(|(i, a)| {
+        rects[i + 1..].iter().any(|b| a.0 < b.0 + b.2 && b.0 < a.0 + a.2 && a.1 < b.1 + b.3 && b.1 < a.1 + a.3)
     })
 }
 
@@ -1091,5 +1113,36 @@ mod tests {
         other.card = "card1".to_string();
         two_placed.outputs.push(other);
         assert!(screens_span_gpus(&two_placed));
+    }
+
+    #[test]
+    fn restore_plan_orders_a_desktop_whose_screens_still_overlap() {
+        // A peer's screen reported before the wide desktop gave it its
+        // slice sits at (0, 0) on top of the rendering GPU's screen: the
+        // tie must not read as "already in the saved order".
+        let mut peer = placed("card0-HDMI-A-2", "0000:0c:00.0", 0, false);
+        peer.width = 3840;
+        peer.height = 2160;
+        let mut own = placed("card1-HDMI-A-1", "0000:01:00.0", 0, true);
+        own.width = 3840;
+        own.height = 2160;
+        let snap = snapshot(vec![peer, own]);
+        let layout = DisplayLayout::parse(
+            "screen 0000:0c:00.0 HDMI-A-2 mode=3840x2160@30\nscreen 0000:01:00.0 HDMI-A-1 main\n",
+        );
+        assert!(placed_overlap(&snap));
+        assert!(restore_waiting(&layout, &snap));
+        assert_eq!(
+            restore_plan(&layout, &snap),
+            vec![
+                RestoreOp::Order(names(&["card0-HDMI-A-2", "card1-HDMI-A-1"])),
+                RestoreOp::Mode("card0-HDMI-A-2".to_string(), Some("3840x2160@30".to_string())),
+            ]
+        );
+        // Laid out side by side: no overlap, nothing to wait for.
+        let mut apart = snap.clone();
+        apart.outputs[1].desktop_position = Some((3840, 0));
+        assert!(!placed_overlap(&apart));
+        assert!(!restore_waiting(&layout, &apart));
     }
 }
