@@ -1435,7 +1435,9 @@ impl App {
             }
             WmRequest::Close => self.request_close(cx, client),
             WmRequest::SetFloating { floating } => {
-                let area = self.desk_area(cx);
+                let state = self.state_mut();
+                let screen = state.screens.screen_of(client).unwrap_or(state.screens.active);
+                let area = self.screen_area(cx, screen);
                 let gap = self.state_mut().gap;
                 let is_float = self.state_mut().layout_of(client).is_float(client);
                 if is_float != *floating {
@@ -1912,7 +1914,12 @@ impl App {
         }
         // A window on another screen makes that screen the active one
         // first (a click, a bar entry, move-to-screen with follow).
-        self.state_mut().screens.activate_screen_of(client);
+        let state = self.state_mut();
+        if state.screens.activate_screen_of(client).is_none() && state.screens.screen_of(client).is_some() {
+            // On a screen waiting out its removal: not drawn, so it must
+            // not take the keyboard.
+            return;
+        }
         if let Some(ws) = self.state_mut().layout().workspace_of(client) {
             let state = self.state_mut();
             if ws != state.layout().active {
@@ -2671,7 +2678,7 @@ impl App {
             .clients
             .iter()
             .filter(|(id, s)| {
-                !s.warm && !s.pane && s.closing.is_none() && state.screens.screen_of(**id).is_some()
+                !s.warm && !s.pane && s.closing.is_none() && state.screens.screen_of(**id).is_some_and(|i| i < state.screens.live_count())
             })
             .map(|(id, s)| (*id, s.app.clone()))
             .collect();
@@ -2707,7 +2714,7 @@ impl App {
                     && !s.warm
                     && !s.pane
                     && s.closing.is_none()
-                    && state.screens.screen_of(**id).is_some()
+                    && state.screens.screen_of(**id).is_some_and(|i| i < state.screens.live_count())
             })
             .map(|(id, _)| *id)
             .collect();
@@ -3696,7 +3703,11 @@ impl App {
             let per_screen = screens::per_screen_enabled(matches!(cx.os_type(), OsType::LinuxDirect), self.gallery);
             let generation = cx.linux_display_generation();
             let state = self.state_mut();
-            if per_screen != state.screen_source.per_screen || generation != state.screen_source.generation || per_screen {
+            // On Linux direct the screens are re-read on every call (the
+            // tick and WindowGeomChange): a DPI change does not bump the
+            // generation, and the reconcile key is cheap to compare.
+            // Elsewhere they are read once, when the gate changes.
+            if per_screen || per_screen != state.screen_source.per_screen {
                 let geoms = makepad_widgets::makepad_platform::screens();
                 let names = makepad_widgets::makepad_platform::linux_screen_names();
                 let main_name = geoms
@@ -3715,11 +3726,26 @@ impl App {
                 };
             }
         }
-        if self.sync_geometry(cx) {
-            self.sync_bar_for_fullscreen(cx);
-            self.update_bar(cx);
-            self.redraw_all(cx);
+        self.sync_geometry(cx);
+        self.drain_screens_changed(cx);
+    }
+
+    /// After a reconcile (here, or from the desk draw, which cannot reach
+    /// the bar): the bar follows, the fullscreen rule is re-applied, and a
+    /// drag in flight is dropped, because screen indices may have shifted.
+    fn drain_screens_changed(&mut self, cx: &mut Cx) {
+        if !self.state.as_ref().is_some_and(|s| s.screens_changed) {
+            return;
         }
+        self.state_mut().screens_changed = false;
+        if self.drag.take().is_some() || self.div_drag.take().is_some() {
+            self.state_mut().dragging.clear();
+            self.state_mut().drop_hint = None;
+            cx.set_cursor(MouseCursor::Default);
+        }
+        self.sync_bar_for_fullscreen(cx);
+        self.update_bar(cx);
+        self.redraw_all(cx);
     }
 
     /// CTRL+ALT+DELETE — `omarchy-hyprland-window-close-all`: close every
@@ -3774,8 +3800,9 @@ impl App {
         };
         if !self.ai_pane_is_open(cx) {
             if let Some(c) = self.state_mut().layout_at(i).focused_client() {
+                // May return early (a no-focus preview): the bar below
+                // follows the new screen either way.
                 self.focus_client(cx, c);
-                return;
             }
         }
         self.update_bar(cx);
@@ -4197,7 +4224,10 @@ impl App {
         };
         self.state_mut().drop_hint = hint;
         if floating && !resize && self.state_mut().style.target==desktop::DesktopStyle::Windows {
-            self.state_mut().snap.drag(client,abs,area);
+            // Snap zones are the edges of the screen under the pointer.
+            let pointer_screen = self.state_mut().screen_under(abs.x, abs.y);
+            let snap_area = self.screen_area(cx, pointer_screen);
+            self.state_mut().snap.drag(client,abs,snap_area);
         }
         self.apply_drag_cursor(cx);
         self.redraw_all(cx);
@@ -4232,9 +4262,17 @@ impl App {
             }
         }
         if drag.floating && !drag.resize && drag.armed && self.state_mut().style.target==desktop::DesktopStyle::Windows {
-            let area=self.desk_area(cx);
+            let pointer_screen = self.state_mut().screen_under(abs.x, abs.y);
+            let area=self.screen_area(cx, pointer_screen);
             self.state_mut().snap.drag(drag.client,abs,area);
             if let Some(zone)=self.state_mut().snap.preview {
+                // The snap applies on the screen under the pointer: the
+                // window moves there first if its centre stayed behind.
+                let state = self.state_mut();
+                if state.screens.screen_of(drag.client) != Some(pointer_screen) {
+                    let (gap, reserved, gaps_out) = (state.gap, state.style.reserved_height(), state.gaps_out);
+                    state.screens.drop_on_screen(drag.client, pointer_screen, gap, reserved, gaps_out);
+                }
                 // Preserve the free window's size before the edge drag.
                 if let Some(w)=self.state_mut().layout_of_mut(drag.client).desktop.get_mut(drag.client) {w.rect=drag.start_rect;}
                 self.apply_snap(cx,drag.client,zone);
@@ -4775,6 +4813,8 @@ impl MatchEvent for App {
             ),
             screen_source: Default::default(),
             screen_key: Default::default(),
+            screen_phys: Default::default(),
+            screens_changed: false,
             dock_backdrop: None,
             clients: std::collections::HashMap::new(),
             hub_port,
@@ -5208,6 +5248,10 @@ impl AppMain for App {
         // before the WM's own binds, the AI pane and any hosted child.
         if self.state.is_some() && self.shell_panel_secret_input(cx, event) {
             return;
+        }
+        // A reconcile in the last desk draw: the bar follows it now.
+        if self.state.is_some() && !matches!(event, Event::Draw(_)) {
+            self.drain_screens_changed(cx);
         }
         self.phone_animation_event(cx,event);
         if let Event::Storage(responses) = event {

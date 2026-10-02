@@ -174,6 +174,11 @@ pub struct ScreenSet {
     pub homes: HashMap<ClientId, String>,
     /// Screen name and the time it was first seen missing.
     pending_removal: Vec<(String, f64)>,
+    /// The live screen the pointer was last seen on (`on_pointer`), so a
+    /// crossing is a change of the POINTER's screen: a focus change that
+    /// made another screen active is not undone by the next mouse move.
+    /// Reset by `reconcile`, which may shift indices.
+    pointer: Option<usize>,
 }
 
 fn contains_rect(outer: LRect, inner: LRect) -> bool {
@@ -223,6 +228,7 @@ impl ScreenSet {
             main: 0,
             homes: HashMap::new(),
             pending_removal: Vec::new(),
+            pointer: None,
         }
     }
 
@@ -400,6 +406,7 @@ impl ScreenSet {
         if new.is_empty() {
             return;
         }
+        self.pointer = None;
         let main_name = main_name.filter(|m| new.iter().any(|(n, _)| n == m));
         let active_name = self.screens.get(self.active).map(|s| s.name.clone());
 
@@ -493,17 +500,41 @@ impl ScreenSet {
         self.homes.retain(|c, _| all.contains(c));
     }
 
-    /// The pointer is at (x, y): `Some(screen)` when it crossed into a
-    /// different live screen (which becomes active), `None` otherwise.
+    /// The pointer is at (x, y): `Some(screen)` when the pointer crossed
+    /// into a different live screen than the one it was last seen on and
+    /// that screen was not already active (it becomes active), `None`
+    /// otherwise. A screen made active some other way (a click on the
+    /// dock, a bar entry, move-to-screen) stays active until the pointer
+    /// itself crosses.
     pub fn on_pointer(&mut self, x: f64, y: f64) -> Option<usize> {
         let live = self.live();
         let rects: Vec<LRect> = live.iter().map(|&i| self.screens[i].rect).collect();
         let i = live[screen_at(&rects, x, y)?];
-        if i == self.active {
+        let crossed = self.pointer != Some(i);
+        self.pointer = Some(i);
+        if !crossed || i == self.active {
             return None;
         }
         self.active = i;
         Some(i)
+    }
+
+    /// The desk's clip moved (the AI pane, a style's bar) but the physical
+    /// screens did not: the live screens, by `new`'s names in the same
+    /// order, take their new clipped rects and outers in place. No window
+    /// moves or is fitted, so a pane that opens and closes again leaves
+    /// every float where it was. False (nothing changed) when `new` does
+    /// not name exactly the live screens in order; reconcile then.
+    pub fn set_clip(&mut self, new: &[(String, LRect)]) -> bool {
+        let live = self.live_count();
+        if new.len() != live || new.iter().zip(&self.screens).any(|((n, _), s)| *n != s.name) {
+            return false;
+        }
+        for ((_, rect), s) in new.iter().zip(self.screens.iter_mut()) {
+            s.rect = *rect;
+            s.layout.set_outer(*rect);
+        }
+        true
     }
 
     /// A drag dropped `c` (a float or desktop-style window) over live
@@ -1184,6 +1215,50 @@ mod tests {
         assert!(!set.drop_on_screen(13, 0, GAP, RB, GO));
         assert!(!set.drop_on_screen(99, 1, GAP, RB, GO));
         assert!(!set.drop_on_screen(13, 5, GAP, RB, GO));
+    }
+
+    #[test]
+    fn a_focus_change_is_not_undone_by_the_pointer_staying_put() {
+        let mut set = two_screens();
+        assert_eq!(set.on_pointer(100.0, 100.0), None);
+        // A dock click / bar entry focuses a window on B; the pointer is
+        // still on A.
+        assert_eq!(set.activate_screen_of(12), Some(1));
+        assert_eq!(set.on_pointer(110.0, 105.0), None);
+        assert_eq!(set.active, 1);
+        // Only a real crossing moves it back.
+        assert_eq!(set.on_pointer(2500.0, 100.0), None);
+        assert_eq!(set.on_pointer(100.0, 100.0), Some(0));
+        assert_eq!(set.active, 0);
+    }
+
+    #[test]
+    fn reconcile_forgets_the_pointer_screen() {
+        let mut set = two_screens();
+        assert_eq!(set.on_pointer(2500.0, 100.0), Some(1));
+        set.reconcile(&ab(), Some("A"), 1.0, GAP, RB, GO);
+        set.active = 0;
+        // Indices may have shifted: the next sighting counts as a crossing.
+        assert_eq!(set.on_pointer(2500.0, 100.0), Some(1));
+    }
+
+    #[test]
+    fn a_desk_clip_that_narrows_and_restores_moves_no_window() {
+        let mut set = two_screens();
+        set.screens[0].layout.add_float(7, LRect::new(10.0, 100.0, 1800.0, 300.0), 0);
+        let f13 = set.screens[1].layout.float_rect(13);
+        // The AI pane opens: A's clipped rect loses 600 on the left.
+        let narrow = vec![(n("A"), LRect::new(600.0, 0.0, 1320.0, 1080.0)), (n("B"), RB_)];
+        assert!(set.set_clip(&narrow));
+        assert_eq!(set.rects(), vec![LRect::new(600.0, 0.0, 1320.0, 1080.0), RB_]);
+        assert!(set.set_clip(&ab()));
+        assert_eq!(set.rects(), vec![RA, RB_]);
+        assert_eq!(set.screens[0].layout.float_rect(7), Some(LRect::new(10.0, 100.0, 1800.0, 300.0)));
+        assert_eq!(set.screens[1].layout.float_rect(13), f13);
+        // Not the live screens in order: refused, nothing changed.
+        assert!(!set.set_clip(&[(n("B"), RB_), (n("A"), RA)]));
+        assert!(!set.set_clip(&[(n("A"), RA)]));
+        assert_eq!(set.rects(), vec![RA, RB_]);
     }
 
     #[test]
