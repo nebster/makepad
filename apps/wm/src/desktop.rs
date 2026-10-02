@@ -533,12 +533,23 @@ fn dock_app_ids(state: &WmState) -> Vec<String> {
     }
     apps
 }
+/// The rect the dock lays out in: the main screen's on a multi-screen
+/// desktop (where the desk reserves its height), else `full`, the whole
+/// window as before. The shelf's drawing, hits and magnification, the
+/// compositor's blur footprint and the minimize warp's target all go
+/// through here, so they agree.
+fn dock_screen(state: &WmState, full: Rect) -> Rect {
+    match state.screens.main_rect() {
+        Some(r) if !state.style.target.mobile() => rect(r.x, r.y, r.w, r.h),
+        _ => full,
+    }
+}
 pub fn dock_bounds(state: &WmState, size: Vec2d) -> Rect {
-    shelf_layout(rect(0.0,0.0,size.x,size.y), &state.style, dock_app_ids(state).len()).bar
+    shelf_layout(dock_screen(state, rect(0.0,0.0,size.x,size.y)), &state.style, dock_app_ids(state).len()).bar
 }
 pub fn dock_icon_bounds(state: &WmState, size: Vec2d, app: &str) -> Rect {
     let apps=dock_app_ids(state);
-    let dock=shelf_layout(rect(0.0,0.0,size.x,size.y), &state.style, apps.len()).bar;
+    let dock=shelf_layout(dock_screen(state, rect(0.0,0.0,size.x,size.y)), &state.style, apps.len()).bar;
     let slot=apps.iter().position(|id| id==&format!("apps.{app}")).map(|i|i+1).unwrap_or(0);
     let cell=(dock.size.x-20.0)/(apps.len()+1) as f64;
     mac_icon_box(rect(dock.pos.x+10.0+slot as f64*cell,dock.pos.y+6.0,cell,dock.size.y-12.0), 0.0)
@@ -603,7 +614,7 @@ impl Widget for DesktopShelf {
                     }
                 }
                 let n = (apps.len() + 1).max(1) as f64;
-                let layout = shelf_layout(screen, t, apps.len());
+                let layout = shelf_layout(dock_screen(state, screen), t, apps.len());
                 let r = layout.bar;
                 self.bounds = layout.next.map_or(r, |next| union_rect(r, next));
                 // Window-backed Gaussian blur, sampled from the live desktop.

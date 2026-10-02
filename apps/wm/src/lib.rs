@@ -543,6 +543,15 @@ pub struct App {
     /// to that segment's switch.
     #[rust]
     bar_press_segment: usize,
+    /// The screens the menu, the OSD and the notification stack were last
+    /// opened on (the active one at the time): each draws there on a
+    /// multi-screen desktop (`sync_surface_targets`).
+    #[rust]
+    menu_screen: usize,
+    #[rust]
+    osd_screen: usize,
+    #[rust]
+    notes_screen: usize,
     /// The Wi-Fi dropdown's iwd link (Linux, shell/wifi_linux.rs): started
     /// when the dropdown first opens, alive for the session, dropped at
     /// shutdown.
@@ -3214,6 +3223,7 @@ impl App {
         let path = if path.is_empty() && self.state_mut().style.target == desktop::DesktopStyle::NextStep {
             "workspace"
         } else { path };
+        self.menu_screen = self.state_mut().screens.active;
         let menu = self.ui.widget(cx, ids!(shell_menu));
         {
             let mut borrowed = menu.borrow_mut::<ShellMenu>();
@@ -3430,6 +3440,9 @@ impl App {
     /// The in-process notification API — `WmRequest::Notify{title, body}`
     /// lands here.
     pub fn notify(&mut self, cx: &mut Cx, title: &str, body: &str) {
+        if let Some(state) = self.state.as_ref() {
+            self.notes_screen = state.screens.active;
+        }
         let notes = self.ui.widget(cx, ids!(shell_notes));
         {
             let mut borrowed = notes.borrow_mut::<shell::notifications::ShellNotifications>();
@@ -3443,6 +3456,9 @@ impl App {
     /// Show the volume OSD (the wheel over the audio module, and the
     /// volume keys).
     fn show_osd(&mut self, cx: &mut Cx, show: shell::osd::OsdShow) {
+        if let Some(state) = self.state.as_ref() {
+            self.osd_screen = state.screens.active;
+        }
         let osd = self.ui.widget(cx, ids!(shell_osd));
         {
             let mut borrowed = osd.borrow_mut::<shell::osd::ShellOsd>();
@@ -3562,6 +3578,67 @@ impl App {
     /// Whether the bar draws one segment per live screen: two or more of
     /// them in a desktop style (a mobile style shows the active screen's
     /// layout only, and its own bar).
+    /// Where a shell surface opened on screen `screen` draws: that live
+    /// screen's rect (the active one's for a screen that went away) on a
+    /// multi-screen desktop style; `None`, the whole overlay, on one screen,
+    /// off Linux direct, in the gallery and in a mobile style.
+    fn surface_target(&self, screen: usize) -> Option<Rect> {
+        let state = self.state.as_ref()?;
+        if state.style.target.mobile() {
+            return None;
+        }
+        state.screens.surface_rect(screen).map(|r| rect(r.x, r.y, r.w, r.h))
+    }
+
+    /// Point the menu, the flyout, the OSD and the notification stack at
+    /// the screens they were opened on, right before every draw: the rects
+    /// follow a reconcile or the AI pane's clip within a frame. A surface
+    /// whose target changed is redrawn; nothing else is touched.
+    fn sync_surface_targets(&mut self, cx: &mut Cx) {
+        let menu = self.surface_target(self.menu_screen);
+        let panel = self.surface_target(self.bar_screen(self.shell_panel_segment));
+        let osd = self.surface_target(self.osd_screen);
+        let notes = self.surface_target(self.notes_screen);
+        if let Some(mut m) = self.ui.widget(cx, ids!(shell_menu)).borrow_mut::<ShellMenu>() {
+            if m.target != menu {
+                m.target = menu;
+                m.redraw(cx);
+            }
+        }
+        if let Some(mut p) = self.ui.widget(cx, ids!(shell_panel)).borrow_mut::<shell::panels::ShellPanel>() {
+            if p.target != panel {
+                p.target = panel;
+                p.redraw(cx);
+            }
+        }
+        if let Some(mut o) = self.ui.widget(cx, ids!(shell_osd)).borrow_mut::<shell::osd::ShellOsd>() {
+            if o.target != osd {
+                o.target = osd;
+                o.redraw(cx);
+            }
+        }
+        if let Some(mut n) = self
+            .ui
+            .widget(cx, ids!(shell_notes))
+            .borrow_mut::<shell::notifications::ShellNotifications>()
+        {
+            if n.target != notes {
+                n.target = notes;
+                n.redraw(cx);
+            }
+        }
+    }
+
+    /// Screen `i`'s focused window when it can take the keyboard: `None`
+    /// for an empty screen and for a no-focus Quick Look preview, which
+    /// `focus_client` refuses, so crossing into either must release the
+    /// old screen's window instead.
+    fn screen_keyboard_client(&mut self, i: usize) -> Option<ClientId> {
+        let state = self.state_mut();
+        let c = state.layout_at(i).focused_client()?;
+        state.clients.get(&c).map_or(true, |s| s.takes_focus).then_some(c)
+    }
+
     fn bar_segmented(&self) -> bool {
         self.state
             .as_ref()
@@ -3604,7 +3681,7 @@ impl App {
         let old = self.state_mut().screens.active;
         self.state_mut().screens.active = screen;
         self.do_action(cx, WmAction::Workspace(ws));
-        if screen != old && self.state_mut().layout().focused_client().is_none() {
+        if screen != old && self.screen_keyboard_client(screen).is_none() {
             self.release_screen_keyboard(cx, old);
         }
     }
@@ -3889,12 +3966,12 @@ impl App {
             return;
         };
         if !self.ai_pane_is_open(cx) {
-            if let Some(c) = self.state_mut().layout_at(i).focused_client() {
-                // May return early (a no-focus preview): the bar below
-                // follows the new screen either way.
+            if let Some(c) = self.screen_keyboard_client(i) {
                 self.focus_client(cx, c);
             } else {
-                // An empty screen: the keyboard leaves the old one's window.
+                // An empty screen, or one whose focused window is a
+                // no-focus preview: the keyboard leaves the old one's
+                // window.
                 self.release_screen_keyboard(cx, old);
             }
         }
@@ -5487,6 +5564,7 @@ impl AppMain for App {
         if let Event::Draw(_) = event {
             if self.state.is_some() {
                 self.sync_ai_pane_geometry(cx);
+                self.sync_surface_targets(cx);
             }
         }
         // SUPER + mouse:272 / mouse:273 — move and resize (tiling.lua).

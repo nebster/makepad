@@ -172,6 +172,8 @@ impl App {
                 .and_then(|bar| bar.module_rect(self.bar_press_segment, BarModule::Style))
         };
         self.open_shell_menu(cx, "desktop", MenuSkin::Menu);
+        // Under the switch it was pressed in: that segment's screen.
+        self.menu_screen = self.bar_screen(self.bar_press_segment);
         let active = format!("desktop.{}", self.current_desktop_sheet().id);
         if let Some(mut menu) = self.ui.widget(cx, ids!(shell_menu)).borrow_mut::<ShellMenu>() {
             menu.anchor = anchor;

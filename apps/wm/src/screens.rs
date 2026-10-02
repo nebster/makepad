@@ -282,6 +282,28 @@ impl ScreenSet {
         Some(i)
     }
 
+    /// Where a shell surface (menu, flyout, OSD, notifications) opened for
+    /// live screen `i` draws: that screen's rect, or the active screen's
+    /// when `i` is no longer live. `None` with fewer than two live screens:
+    /// the surface keeps today's whole-overlay rect.
+    pub fn surface_rect(&self, i: usize) -> Option<LRect> {
+        let live = self.live_count();
+        if live < 2 {
+            return None;
+        }
+        let i = if i < live { i } else { self.active };
+        self.screens.get(i).map(|s| s.rect)
+    }
+
+    /// The main screen's rect, where the dock sits; `None` with fewer than
+    /// two live screens (the dock spans the whole overlay, as before).
+    pub fn main_rect(&self) -> Option<LRect> {
+        if self.live_count() < 2 || self.main >= self.live_count() {
+            return None;
+        }
+        Some(self.screens[self.main].rect)
+    }
+
     /// The dock's reservation on screen `i`: the dock sits on the main
     /// screen only, so every other screen keeps its full height.
     pub fn reserved_for(&self, i: usize, reserved_bottom: f64) -> f64 {
@@ -1284,5 +1306,126 @@ mod tests {
         assert_eq!(set.active, 1);
         assert_eq!(set.activate_screen_of(99), None);
         assert_eq!(set.active, 1);
+    }
+
+    // --- Task 7: surfaces on the active screen, the dock on the main ----
+
+    #[test]
+    fn one_screen_gives_no_surface_or_dock_target() {
+        let set = fallback_set();
+        assert_eq!(set.surface_rect(0), None);
+        assert_eq!(set.main_rect(), None);
+    }
+
+    #[test]
+    fn surfaces_target_their_screen_and_the_dock_the_main_one() {
+        let mut set = two_screens();
+        assert_eq!(set.surface_rect(0), Some(RA));
+        assert_eq!(set.surface_rect(1), Some(RB_));
+        assert_eq!(set.main_rect(), Some(RA));
+        // A stale index (a screen that went away) takes the active one.
+        set.active = 1;
+        assert_eq!(set.surface_rect(7), Some(RB_));
+        set.reconcile(&ab(), Some("B"), 0.0, GAP, RB, GO);
+        assert_eq!(set.main_rect(), Some(RB_));
+    }
+
+    #[test]
+    fn a_pending_screen_is_no_surface_target() {
+        let mut set = two_screens();
+        set.active = 0;
+        set.reconcile(&[(n("A"), RA)], Some("A"), 10.0, GAP, RB, GO);
+        // B waits out its debounce: one live screen, today's whole desk.
+        assert_eq!(set.live_count(), 1);
+        assert_eq!(set.surface_rect(1), None);
+        assert_eq!(set.main_rect(), None);
+    }
+
+    fn to_rect(r: LRect) -> makepad_widgets::Rect {
+        makepad_widgets::rect(r.x, r.y, r.w, r.h)
+    }
+
+    fn inside(outer: makepad_widgets::Rect, inner: makepad_widgets::Rect) -> bool {
+        inner.pos.x >= outer.pos.x - 1e-6
+            && inner.pos.y >= outer.pos.y - 1e-6
+            && inner.pos.x + inner.size.x <= outer.pos.x + outer.size.x + 1e-6
+            && inner.pos.y + inner.size.y <= outer.pos.y + outer.size.y + 1e-6
+    }
+
+    /// The menu card laid out in a screen that does not start at 0 (the
+    /// right screen of two, under the bar strip) stays inside it, for
+    /// every desktop style, centred or anchored to a bar module, a module
+    /// at either end of the segment included.
+    #[test]
+    fn the_menu_card_stays_inside_a_target_that_does_not_start_at_zero() {
+        use crate::desktop::DesktopStyle;
+        use crate::shell::menu::{menu_card_layout, MenuCardSpec};
+        let screen = makepad_widgets::rect(1920.0, 26.0, 1280.0, 974.0);
+        let dividers = vec![false, true, false, false, false, false, false, false];
+        let anchors = [
+            None,
+            Some(makepad_widgets::rect(1924.0, 0.0, 40.0, 26.0)),
+            Some(makepad_widgets::rect(3180.0, 0.0, 40.0, 26.0)),
+            // A module of the left segment: still clamped onto this screen.
+            Some(makepad_widgets::rect(1700.0, 0.0, 40.0, 26.0)),
+        ];
+        for style in [
+            DesktopStyle::Omarchy,
+            DesktopStyle::Macos,
+            DesktopStyle::Windows,
+            DesktopStyle::Windows2000,
+            DesktopStyle::NextStep,
+        ] {
+            for anchor in anchors {
+                for filter_empty in [true, false] {
+                    let spec = MenuCardSpec {
+                        anchor,
+                        style,
+                        filter_empty,
+                        row_height: 30.0,
+                        dividers: &dividers,
+                        empty_block_h: 60.0,
+                        panel_padding: 14.0,
+                        gaps_out: 10.0,
+                        frozen_top: None,
+                    };
+                    let (card, visible) = menu_card_layout(&spec, screen);
+                    assert!(visible >= 1);
+                    assert!(
+                        inside(screen, card),
+                        "{style:?} anchor {anchor:?}: {card:?} outside {screen:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A flyout anchored to a module near the seam is clamped inside its
+    /// own segment's screen, not centred across the seam.
+    #[test]
+    fn a_panel_anchor_is_clamped_inside_its_screen() {
+        use crate::shell::panels::panel_card_rect;
+        let left = to_rect(LRect::new(0.0, 26.0, 1920.0, 1054.0));
+        let right = to_rect(LRect::new(1920.0, 26.0, 1920.0, 1054.0));
+        let w = 360.0;
+        let margin = 10.0;
+        // The left screen's last module, right at the seam.
+        let a = makepad_widgets::rect(1890.0, 0.0, 28.0, 26.0);
+        let card = panel_card_rect(a, left, w, 400.0, margin, 26.0);
+        assert!(inside(left, card), "{card:?}");
+        assert_eq!(card.pos.x + card.size.x, 1920.0 - margin);
+        // The right screen's first module, right at the seam.
+        let b = makepad_widgets::rect(1922.0, 0.0, 28.0, 26.0);
+        let card = panel_card_rect(b, right, w, 400.0, margin, 26.0);
+        assert!(inside(right, card), "{card:?}");
+        assert_eq!(card.pos.x, 1920.0 + margin);
+        // In the middle of a screen: centred on the module, under the bar.
+        let c = makepad_widgets::rect(2800.0, 0.0, 40.0, 26.0);
+        let card = panel_card_rect(c, right, w, 400.0, margin, 26.0);
+        assert_eq!(card.pos.x, (2820.0f64 - 180.0).floor());
+        assert_eq!(card.pos.y, 36.0);
+        // A height past the screen's bottom is cut at the margin.
+        let card = panel_card_rect(c, right, w, 5000.0, margin, 26.0);
+        assert!(inside(right, card), "{card:?}");
     }
 }
