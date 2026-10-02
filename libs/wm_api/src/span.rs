@@ -161,6 +161,56 @@ pub fn screens_in_window(screens: &[WmScreen], window_x: f64, window_y: f64) -> 
         .collect()
 }
 
+/// The screen a standalone app should treat as "current" for
+/// [`ScreenSpan::Current`]: there is no WM-tracked window position, so the
+/// primary screen stands in for it, or the first (left-most) screen when
+/// none is marked primary. `None` when `screens` is empty.
+pub fn primary_or_first_index(screens: &[WmScreen]) -> Option<usize> {
+    if screens.is_empty() {
+        return None;
+    }
+    Some(screens.iter().position(|s| s.primary).unwrap_or(0))
+}
+
+/// Resolve a `set_fullscreen_span` request against the live `screens` for
+/// a standalone app with no WM to answer it -- the pure core of the
+/// direct backend's `set_fullscreen_span`, and testable without a live
+/// desktop. Returns the span actually recorded (its screens' names, left
+/// to right) and whether the request was honoured, mirroring the WM's own
+/// rule: a span that cannot be resolved is dropped (recorded as `None`)
+/// rather than left stale.
+pub fn resolve_standalone_span(
+    screens: &[WmScreen],
+    current: Option<usize>,
+    span: Option<ScreenSpan>,
+) -> (Option<Vec<String>>, bool) {
+    let Some(span) = span else {
+        return (None, true);
+    };
+    match span_rect(screens, &span, current) {
+        Ok((range, _)) => (
+            Some(screens[range].iter().map(|s| s.name.clone()).collect()),
+            true,
+        ),
+        Err(_) => (None, false),
+    }
+}
+
+/// Re-resolve a standalone app's recorded span against the live `screens`
+/// on read: a hotplug/reorder since it was set can make `recorded` no
+/// longer a live, adjacent run, in which case it has lapsed (`None`) the
+/// same way the WM drops a span whose screens are no longer live.
+pub fn resolve_standalone_current_span(
+    screens: &[WmScreen],
+    recorded: &Option<Vec<String>>,
+) -> Option<Vec<String>> {
+    let names = recorded.clone()?;
+    let span = ScreenSpan::Screens(names);
+    span_rect(screens, &span, None)
+        .ok()
+        .map(|(range, _)| screens[range].iter().map(|s| s.name.clone()).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,5 +439,106 @@ mod tests {
             let parsed = SpanError::deserialize_json(&json).unwrap();
             assert_eq!(parsed, err);
         }
+    }
+
+    // ---- standalone span resolution (direct mode, no WM to answer) ----
+
+    #[test]
+    fn primary_or_first_index_picks_the_primary_screen() {
+        let mut screens = three();
+        screens[2].primary = true;
+        assert_eq!(primary_or_first_index(&screens), Some(2));
+    }
+
+    #[test]
+    fn primary_or_first_index_falls_back_to_the_first_screen() {
+        let screens = three();
+        assert_eq!(primary_or_first_index(&screens), Some(0));
+    }
+
+    #[test]
+    fn primary_or_first_index_empty_is_none() {
+        assert_eq!(primary_or_first_index(&[]), None);
+    }
+
+    #[test]
+    fn resolve_standalone_span_none_leaves_fullscreen() {
+        let screens = three();
+        assert_eq!(
+            resolve_standalone_span(&screens, Some(0), None),
+            (None, true)
+        );
+    }
+
+    #[test]
+    fn resolve_standalone_span_resolves_a_subset() {
+        let screens = three();
+        let span = ScreenSpan::Screens(vec!["b".into(), "c".into()]);
+        let (recorded, ok) = resolve_standalone_span(&screens, None, Some(span));
+        assert!(ok);
+        assert_eq!(recorded, Some(vec!["b".into(), "c".into()]));
+    }
+
+    #[test]
+    fn resolve_standalone_span_resolves_all() {
+        let screens = three();
+        let (recorded, ok) = resolve_standalone_span(&screens, None, Some(ScreenSpan::All));
+        assert!(ok);
+        assert_eq!(recorded, Some(vec!["a".into(), "b".into(), "c".into()]));
+    }
+
+    #[test]
+    fn resolve_standalone_span_resolves_current_via_the_given_index() {
+        let screens = three();
+        let (recorded, ok) =
+            resolve_standalone_span(&screens, Some(1), Some(ScreenSpan::Current));
+        assert!(ok);
+        assert_eq!(recorded, Some(vec!["b".into()]));
+    }
+
+    #[test]
+    fn resolve_standalone_span_unresolvable_is_dropped() {
+        let screens = three();
+        let span = ScreenSpan::Screens(vec!["a".into(), "c".into()]); // not adjacent
+        let (recorded, ok) = resolve_standalone_span(&screens, None, Some(span));
+        assert!(!ok);
+        assert_eq!(recorded, None);
+    }
+
+    #[test]
+    fn resolve_standalone_span_unknown_name_is_dropped() {
+        let screens = three();
+        let span = ScreenSpan::Screens(vec!["z".into()]);
+        let (recorded, ok) = resolve_standalone_span(&screens, None, Some(span));
+        assert!(!ok);
+        assert_eq!(recorded, None);
+    }
+
+    #[test]
+    fn resolve_standalone_current_span_reresolves_live_names() {
+        let screens = three();
+        let recorded = Some(vec!["b".into(), "c".into()]);
+        assert_eq!(
+            resolve_standalone_current_span(&screens, &recorded),
+            Some(vec!["b".into(), "c".into()])
+        );
+    }
+
+    #[test]
+    fn resolve_standalone_current_span_none_when_unset() {
+        let screens = three();
+        assert_eq!(resolve_standalone_current_span(&screens, &None), None);
+    }
+
+    #[test]
+    fn resolve_standalone_current_span_drops_on_hotplug_removal() {
+        // "b" was spanned, then unplugged: only "a" and "c" remain, no
+        // longer adjacent under that name -- the span has lapsed.
+        let screens = vec![
+            screen("a", 0.0, 0.0, 1920.0, 1080.0),
+            screen("c", 1920.0, 0.0, 1920.0, 1080.0),
+        ];
+        let recorded = Some(vec!["b".into(), "c".into()]);
+        assert_eq!(resolve_standalone_current_span(&screens, &recorded), None);
     }
 }

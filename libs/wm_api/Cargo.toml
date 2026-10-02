@@ -15,6 +15,13 @@ license = "MIT OR Apache-2.0"
 name = "makepad_wm_api"
 path = "src/lib.rs"
 
+# `gpusim` is `platform`'s own cfg for its simulated-GPU test backend
+# (declared there by its build script); the Linux direct-mode standalone
+# span helpers below gate on it the same way `platform::screens()` does,
+# without a build script of this crate's own.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(gpusim)"] }
+
 [dependencies]
 makepad-widgets-core = { path = "../../widgets/core" }
 
