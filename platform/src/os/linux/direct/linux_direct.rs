@@ -458,6 +458,7 @@ impl Cx {
             .collect();
         // Desktop order: left to right by position.
         screens.sort_by(|a, b| a.bounds.pos.x.partial_cmp(&b.bounds.pos.x).unwrap_or(std::cmp::Ordering::Equal));
+        direct_app.raw_input.set_screens(screens.clone());
         crate::screen::set_linux_screens(screens);
         direct_app.published_screens = Some(key);
     }

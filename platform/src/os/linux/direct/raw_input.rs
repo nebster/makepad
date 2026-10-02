@@ -867,6 +867,9 @@ pub struct RawInput {
     height: f64,
     dpi_factor: f64,
     abs: Vec2d,
+    /// The wide desktop's screens: relative pointer motion stays on them, so
+    /// screens of different heights leave no reachable dead corners.
+    screens: Vec<crate::screen::ScreenGeom>,
 }
 
 impl RawInput {
@@ -881,6 +884,7 @@ impl RawInput {
             height,
             dpi_factor,
             abs: dvec2(0.0, 0.0),
+            screens: Vec::new(),
             modifiers: Default::default(),
         };
         input.scan_devices();
@@ -898,6 +902,20 @@ impl RawInput {
         }
         self.abs.x = self.abs.x.clamp(0.0, width.max(0.0));
         self.abs.y = self.abs.y.clamp(0.0, height.max(0.0));
+        self.clamp_to_screens();
+    }
+
+    /// The screens of the wide desktop, in the same coordinates as the
+    /// pointer; an empty list keeps the plain bounds clamp.
+    pub fn set_screens(&mut self, screens: Vec<crate::screen::ScreenGeom>) {
+        self.screens = screens;
+        self.clamp_to_screens();
+    }
+
+    fn clamp_to_screens(&mut self) {
+        if !self.screens.is_empty() {
+            self.abs = crate::screen::clamp_point_to_screens(&self.screens, self.abs);
+        }
     }
 
     fn scan_devices(&mut self) {
@@ -1062,6 +1080,7 @@ impl RawInput {
                     } else {
                         self.abs.x = (self.abs.x + delta.x).clamp(0.0, self.width.max(0.0));
                         self.abs.y = (self.abs.y + delta.y).clamp(0.0, self.height.max(0.0));
+                        self.clamp_to_screens();
                         dir_evts.push(DirectEvent::MouseMove(MouseMoveEvent {
                             lock_delta: Default::default(), abs: self.abs, window_id,
                             modifiers: self.modifiers, time, handled: Cell::new(Area::Empty),
@@ -1105,6 +1124,7 @@ impl RawInput {
                 if self.abs.x > self.width {
                     self.abs.x = self.width
                 }
+                self.clamp_to_screens();
             }
             EvRelCodes::REL_Y => {
                 self.abs.y += evt.value as f64 * crate::linux_input::pointer_speed(false) as f64 / 100.0 / self.dpi_factor;
@@ -1114,6 +1134,7 @@ impl RawInput {
                 if self.abs.y > self.height {
                     self.abs.y = self.height
                 }
+                self.clamp_to_screens();
             }
             EvRelCodes::REL_WHEEL | EvRelCodes::REL_HWHEEL => {
                 let delta = evt.value as f64 * 40.0;
