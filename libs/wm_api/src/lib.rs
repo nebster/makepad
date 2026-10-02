@@ -20,6 +20,9 @@ use makepad_widgets_core::makepad_platform::studio::AppToStudio;
 use makepad_widgets_core::*;
 use std::path::{Path, PathBuf};
 
+mod span;
+pub use span::{screens_in_window, span_rect, ScreenSpan, SpanError, WmScreen};
+
 /// What an app can ask the window manager.
 #[derive(Clone, Debug, PartialEq, SerJson, DeJson)]
 pub enum WmRequest {
