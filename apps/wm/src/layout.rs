@@ -1982,6 +1982,9 @@ impl WmLayout {
         for w in &mut self.desktop.windows {
             w.rect = crate::desktop_layout::fit(w.rect, area);
         }
+        for (_, r) in &mut self.float_memory {
+            *r = crate::desktop_layout::fit(*r, area);
+        }
     }
 
     /// Take one client out of this layout entirely (the `remove` path:

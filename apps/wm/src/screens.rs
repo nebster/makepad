@@ -20,12 +20,13 @@ use crate::layout::{transfer_client, ClientId, Detached, LRect, WmLayout, SCRATC
 /// not scatter windows.
 pub const REMOVAL_DEBOUNCE: f64 = 2.0;
 
-/// All of: running the Linux direct backend, not a mobile style, not the
-/// gallery, and at least two screens published. Any single failing
-/// condition means per-screen behaviour is off and the WM uses one
-/// fallback entry covering the whole desk (today's behaviour).
-pub fn per_screen_enabled(linux_direct: bool, mobile: bool, gallery: bool, screen_count: usize) -> bool {
-    linux_direct && !mobile && !gallery && screen_count >= 2
+/// Running the Linux direct backend and not the gallery. Otherwise
+/// per-screen behaviour is off and the WM uses one fallback entry covering
+/// the whole desk (today's behaviour). A mobile style does NOT turn it off:
+/// the per-screen layouts are kept and only the active one is shown. How
+/// many screens it takes is `screen_rects_for`'s business.
+pub fn per_screen_enabled(linux_direct: bool, gallery: bool) -> bool {
+    linux_direct && !gallery
 }
 
 /// The intersection of `screen` and `desk`; `None` if they don't overlap
@@ -42,29 +43,48 @@ pub fn clip_to_desk(screen: LRect, desk: LRect) -> Option<LRect> {
     }
 }
 
-/// The per-screen rects the desk should use, left to right. When
-/// `per_screen` is false, `names` and `geoms` disagree in length, or
-/// clipping each screen to `desk` leaves fewer than two non-empty rects,
-/// the whole desk is one fallback entry named `""` — exactly today's
-/// single-screen behaviour (also what runs on macOS/Windows, where
-/// `screens()` isn't desk coordinates, and in mobile/gallery styles).
-/// Otherwise each surviving screen is `(name, clip_to_desk(geom, desk))`,
-/// in the same left-to-right order as `names`/`geoms`; a screen whose clip
-/// is empty (fully off the desk) is skipped.
-pub fn screen_rects_for(per_screen: bool, names: &[String], geoms: &[LRect], desk: LRect) -> Vec<(String, LRect)> {
+/// The per-screen rects the desk should use, left to right: each screen
+/// that survives clipping is `(name, clip_to_desk(geom, desk))`, in the
+/// same order as `names`/`geoms` (a screen fully off the desk is skipped).
+///
+/// - `per_screen` false (gallery, not Linux direct: macOS/Windows
+///   `screens()` aren't desk coordinates): one fallback entry `("", desk)`.
+/// - `named` false (the set is still the `""` fallback, see
+///   `ScreenSet::is_named`): it takes at least two clipped screens to go
+///   per-screen; fewer, or `names`/`geoms` disagreeing in length, gives the
+///   fallback — today's single-screen behaviour.
+/// - `named` true: a named set never falls back on a hotplug. One clipped
+///   screen stays a named entry, so a lost screen goes through the removal
+///   debounce; a length mismatch (names and geoms read mid-hotplug) or no
+///   clipped screen at all gives an EMPTY Vec, which `ScreenSet::reconcile`
+///   ignores (wait for the next publish).
+pub fn screen_rects_for(
+    per_screen: bool,
+    named: bool,
+    names: &[String],
+    geoms: &[LRect],
+    desk: LRect,
+) -> Vec<(String, LRect)> {
     let fallback = || vec![("".to_string(), desk)];
-    if !per_screen || names.len() != geoms.len() {
+    if !per_screen {
         return fallback();
+    }
+    if names.len() != geoms.len() {
+        return if named { Vec::new() } else { fallback() };
     }
     let clipped: Vec<(String, LRect)> = names
         .iter()
         .zip(geoms.iter())
         .filter_map(|(name, geom)| clip_to_desk(*geom, desk).map(|r| (name.clone(), r)))
         .collect();
-    if clipped.len() < 2 {
-        return fallback();
+    let need = if named { 1 } else { 2 };
+    if clipped.len() >= need {
+        clipped
+    } else if named {
+        Vec::new()
+    } else {
+        fallback()
     }
-    clipped
 }
 
 /// Squared Euclidean distance from `(x, y)` to the nearest point of `r`
@@ -131,9 +151,16 @@ pub struct ScreenLayout {
     pub layout: WmLayout,
 }
 
-/// One `WmLayout` per screen, left to right in `screens()` order. Screens
-/// waiting out the removal debounce stay at the END of `screens` (after
-/// every live screen) until they migrate or come back.
+/// One `WmLayout` per screen, left to right in `screens()` order.
+///
+/// Index invariants (after every `reconcile`):
+/// - `screens[..live_count()]` are the LIVE screens, index-aligned with the
+///   last non-empty `reconcile` input.
+/// - `screens[live_count()..]` are PENDING: missing from the input, waiting
+///   out `REMOVAL_DEBOUNCE` with their layouts intact, at stale rects. They
+///   are never drawn, never hit by the pointer, never a move-to-screen
+///   source or target, and never made active.
+/// - `active < live_count()` and `main < live_count()`.
 pub struct ScreenSet {
     pub screens: Vec<ScreenLayout>,
     /// The pointer / explicit-focus screen: new windows, menus and
@@ -226,14 +253,32 @@ impl ScreenSet {
         self.screens.iter().map(|s| s.rect).collect()
     }
 
-    fn is_pending(&self, name: &str) -> bool {
-        self.pending_removal.iter().any(|(n, _)| n == name)
+    /// Not the single `""` fallback any more (see `screen_rects_for`'s
+    /// `named`).
+    pub fn is_named(&self) -> bool {
+        !(self.screens.len() == 1 && self.screens[0].name.is_empty())
+    }
+
+    /// How many screens are live; they are `screens[..live_count()]`, and
+    /// the pending ones follow. Multi-screen behaviour (per-screen bar,
+    /// move-to-screen, fullscreen-as-maximize) is `live_count() >= 2`.
+    pub fn live_count(&self) -> usize {
+        self.screens.len() - self.pending_removal.len()
+    }
+
+    /// Make the live screen holding `c` active (`focus_client` on another
+    /// screen's window). `None`, and `active` unchanged, when `c` is
+    /// unknown or sits on a pending screen.
+    pub fn activate_screen_of(&mut self, c: ClientId) -> Option<usize> {
+        let i = self.screen_of(c).filter(|&i| i < self.live_count())?;
+        self.active = i;
+        Some(i)
     }
 
     /// Indices of the screens that are really there (not waiting out the
     /// removal debounce), left to right.
     fn live(&self) -> Vec<usize> {
-        (0..self.screens.len()).filter(|&i| !self.is_pending(&self.screens[i].name)).collect()
+        (0..self.live_count()).collect()
     }
 
     fn index_of(&self, name: &str) -> Option<usize> {
@@ -244,7 +289,16 @@ impl ScreenSet {
     /// reachable, and hand the layout its new outer rect.
     fn set_rect(s: &mut ScreenLayout, rect: LRect, reserved_bottom: f64, gaps_out: f64) {
         if s.rect != rect {
-            s.layout.translate(rect.x - s.rect.x, rect.y - s.rect.y);
+            // A screen that grew into, or shrank to part of, its old rect
+            // (the "" desk renamed to a screen, a screen merged into the
+            // desk) keeps its windows where they are; only a moved screen
+            // carries them along.
+            let (dx, dy) = if contains_rect(rect, s.rect) || contains_rect(s.rect, rect) {
+                (0.0, 0.0)
+            } else {
+                (rect.x - s.rect.x, rect.y - s.rect.y)
+            };
+            s.layout.translate(dx, dy);
             s.layout.fit_floats(screen_area(rect, reserved_bottom, gaps_out));
         }
         s.layout.set_outer(rect);
@@ -310,7 +364,9 @@ impl ScreenSet {
     ///   `REMOVAL_DEBOUNCE`, then migrated to the main screen (else the
     ///   active one) on the same workspace numbers, recorded in `homes`.
     /// `active` stays on its screen by name (the main screen if that one
-    /// went), `main` is `main_name`'s index, else 0.
+    /// went), `main` is `main_name`'s index, else 0. An empty `new` is
+    /// ignored. A merged survivor's own clients have no `homes` entry, so
+    /// after a later split they stay on the screen the fallback is renamed to.
     pub fn reconcile(
         &mut self,
         new: &[(String, LRect)],
@@ -440,7 +496,7 @@ impl ScreenSet {
             return None;
         }
         let from = self.screen_of(c)?;
-        let pos = live.iter().position(|&i| i == from).unwrap_or(0);
+        let pos = live.iter().position(|&i| i == from)?;
         let n = live.len();
         let to = live[if forward { (pos + 1) % n } else { (pos + n - 1) % n }];
         if to == from {
@@ -470,27 +526,34 @@ mod tests {
 
     #[test]
     fn per_screen_enabled_needs_linux_direct() {
-        assert!(!per_screen_enabled(false, false, false, 2));
-    }
-
-    #[test]
-    fn per_screen_enabled_off_for_mobile() {
-        assert!(!per_screen_enabled(true, true, false, 2));
+        assert!(!per_screen_enabled(false, false));
     }
 
     #[test]
     fn per_screen_enabled_off_for_gallery() {
-        assert!(!per_screen_enabled(true, false, true, 2));
-    }
-
-    #[test]
-    fn per_screen_enabled_needs_two_screens() {
-        assert!(!per_screen_enabled(true, false, false, 1));
+        assert!(!per_screen_enabled(true, true));
     }
 
     #[test]
     fn per_screen_enabled_true_when_all_hold() {
-        assert!(per_screen_enabled(true, false, false, 2));
+        assert!(per_screen_enabled(true, false));
+    }
+
+    #[test]
+    fn mobile_does_not_affect_the_gate() {
+        // The signature has no mobile input: a mobile style keeps the
+        // per-screen layouts (only the active one is shown), so a style
+        // switch can't send the fallback and merge every screen.
+        let direct_desktop = per_screen_enabled(true, false);
+        let direct_mobile = per_screen_enabled(true, false);
+        assert_eq!(direct_desktop, direct_mobile);
+        let desk = LRect::new(0.0, 0.0, 3840.0, 1080.0);
+        let names = vec![n("A"), n("B")];
+        let geoms = vec![
+            LRect::new(0.0, 0.0, 1920.0, 1080.0),
+            LRect::new(1920.0, 0.0, 1920.0, 1080.0),
+        ];
+        assert_eq!(screen_rects_for(direct_mobile, true, &names, &geoms, desk).len(), 2);
     }
 
     // --- screen_rects_for: fallback cases --------------------------------
@@ -503,7 +566,7 @@ mod tests {
             LRect::new(0.0, 0.0, 1920.0, 1080.0),
             LRect::new(1920.0, 0.0, 1920.0, 1080.0),
         ];
-        let got = screen_rects_for(false, &names, &geoms, desk);
+        let got = screen_rects_for(false, false, &names, &geoms, desk);
         assert_eq!(got, vec![(n(""), desk)]);
     }
 
@@ -512,7 +575,7 @@ mod tests {
         let desk = LRect::new(0.0, 0.0, 3840.0, 1080.0);
         let names = vec![n("A"), n("B")];
         let geoms = vec![LRect::new(0.0, 0.0, 1920.0, 1080.0)];
-        let got = screen_rects_for(true, &names, &geoms, desk);
+        let got = screen_rects_for(true, false, &names, &geoms, desk);
         assert_eq!(got, vec![(n(""), desk)]);
     }
 
@@ -526,8 +589,46 @@ mod tests {
             LRect::new(0.0, 0.0, 1920.0, 1080.0),
             LRect::new(5000.0, 0.0, 1920.0, 1080.0),
         ];
-        let got = screen_rects_for(true, &names, &geoms, desk);
+        let got = screen_rects_for(true, false, &names, &geoms, desk);
         assert_eq!(got, vec![(n(""), desk)]);
+    }
+
+    #[test]
+    fn screen_rects_for_unnamed_single_screen_falls_back() {
+        let desk = LRect::new(0.0, 0.0, 1920.0, 1080.0);
+        let names = vec![n("A")];
+        let geoms = vec![LRect::new(0.0, 0.0, 1920.0, 1080.0)];
+        assert_eq!(screen_rects_for(true, false, &names, &geoms, desk), vec![(n(""), desk)]);
+    }
+
+    #[test]
+    fn screen_rects_for_off_falls_back_even_when_named() {
+        let desk = LRect::new(0.0, 0.0, 3840.0, 1080.0);
+        let names = vec![n("A"), n("B")];
+        let geoms = vec![
+            LRect::new(0.0, 0.0, 1920.0, 1080.0),
+            LRect::new(1920.0, 0.0, 1920.0, 1080.0),
+        ];
+        assert_eq!(screen_rects_for(false, true, &names, &geoms, desk), vec![(n(""), desk)]);
+    }
+
+    #[test]
+    fn screen_rects_for_named_keeps_one_remaining_screen() {
+        let desk = LRect::new(0.0, 0.0, 1920.0, 1080.0);
+        let names = vec![n("A")];
+        let geoms = vec![LRect::new(0.0, 0.0, 1920.0, 1080.0)];
+        assert_eq!(screen_rects_for(true, true, &names, &geoms, desk), vec![(n("A"), desk)]);
+    }
+
+    #[test]
+    fn screen_rects_for_named_mismatch_or_nothing_left_is_empty() {
+        let desk = LRect::new(0.0, 0.0, 1920.0, 1080.0);
+        let names = vec![n("A"), n("B")];
+        let geoms = vec![LRect::new(0.0, 0.0, 1920.0, 1080.0)];
+        assert!(screen_rects_for(true, true, &names, &geoms, desk).is_empty());
+        let off = vec![LRect::new(5000.0, 0.0, 1920.0, 1080.0)];
+        assert!(screen_rects_for(true, true, &[n("A")], &off, desk).is_empty());
+        assert!(screen_rects_for(true, true, &[], &[], desk).is_empty());
     }
 
     // --- screen_rects_for: the two-screen wide-desktop cases -------------
@@ -541,7 +642,7 @@ mod tests {
             LRect::new(0.0, 0.0, 1920.0, 1080.0),
             LRect::new(1920.0, 0.0, 1920.0, 1080.0),
         ];
-        let got = screen_rects_for(true, &names, &geoms, desk);
+        let got = screen_rects_for(true, false, &names, &geoms, desk);
         assert_eq!(
             got,
             vec![
@@ -559,7 +660,7 @@ mod tests {
             LRect::new(0.0, 0.0, 1920.0, 1080.0),
             LRect::new(1920.0, 0.0, 1920.0, 720.0),
         ];
-        let got = screen_rects_for(true, &names, &geoms, desk);
+        let got = screen_rects_for(true, false, &names, &geoms, desk);
         assert_eq!(
             got,
             vec![
@@ -578,7 +679,7 @@ mod tests {
             LRect::new(0.0, 0.0, 1920.0, 1080.0),
             LRect::new(1920.0, 0.0, 1920.0, 1080.0),
         ];
-        let got = screen_rects_for(true, &names, &geoms, desk);
+        let got = screen_rects_for(true, false, &names, &geoms, desk);
         assert_eq!(
             got,
             vec![
@@ -705,6 +806,12 @@ mod tests {
         let mut set = fallback_set();
         set.reconcile(&ab(), Some("B"), 0.0, GAP, RB, GO);
         assert_eq!(set.main, 1);
+        // The desk at x=0 became B at x=1920: B lies inside the old desk,
+        // so nothing is shifted by +1920; the float on A's half is only
+        // fitted to keep its title bar reachable on B.
+        let f = set.screens[1].layout.float_rect(3).unwrap();
+        assert_eq!((f.w, f.h, f.y), (400.0, 300.0, 100.0));
+        assert!(f.x < 1920.0, "float was shifted by the origin delta: {:?}", f);
         assert_eq!(sorted(set.screens[1].layout.all_clients()), vec![1, 2, 3]);
         assert!(set.screens[0].layout.all_clients().is_empty());
     }
@@ -734,6 +841,9 @@ mod tests {
         let mut set = two_screens();
         set.reconcile(&[(n("A"), RA)], Some("A"), 10.0, GAP, RB, GO);
         set.reconcile(&ab(), Some("A"), 11.0, GAP, RB, GO);
+        assert_eq!(set.screens.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["A", "B"]);
+        assert_eq!(set.live_count(), 2);
+        assert_eq!(sorted(set.screens[1].layout.all_clients()), vec![10, 11, 12, 13, 14]);
         // Gone again later: the debounce starts over.
         set.reconcile(&[(n("A"), RA)], Some("A"), 12.5, GAP, RB, GO);
         assert_eq!(set.screens.len(), 2);
@@ -846,8 +956,8 @@ mod tests {
         let mut set = two_screens();
         assert_eq!(set.focused_client(), Some(1));
         set.on_pointer(2500.0, 100.0);
-        assert_eq!(set.focused_client(), set.screens[1].layout.focused_client());
-        assert!(set.focused_client().is_some());
+        // B's last arrival on workspace 0 is the float 13.
+        assert_eq!(set.focused_client(), Some(13));
     }
 
     #[test]
@@ -876,5 +986,88 @@ mod tests {
     fn move_to_screen_of_an_unknown_client_is_none() {
         let mut set = two_screens();
         assert_eq!(set.move_to_screen(99, true, GAP, RB, GO), None);
+    }
+    #[test]
+    fn rename_onto_a_right_hand_main_keeps_a_float_already_there() {
+        let mut l = WmLayout::new();
+        l.add_float(3, LRect::new(2500.0, 100.0, 400.0, 300.0), 0);
+        let mut set = ScreenSet::new(l, DESK);
+        set.reconcile(&ab(), Some("B"), 0.0, GAP, RB, GO);
+        assert_eq!(
+            set.screens[1].layout.float_rect(3),
+            Some(LRect::new(2500.0, 100.0, 400.0, 300.0))
+        );
+    }
+
+    #[test]
+    fn merge_into_a_non_origin_survivor_keeps_every_position() {
+        let mut set = two_screens();
+        set.reconcile(&ab(), Some("B"), 1.0, GAP, RB, GO);
+        assert_eq!(set.main, 1);
+        set.screens[0].layout.add_float(5, LRect::new(300.0, 200.0, 400.0, 300.0), 0);
+        set.reconcile(&[(n(""), DESK)], None, 2.0, GAP, RB, GO);
+        let l = &set.screens[0].layout;
+        // The survivor B (x=1920) lies inside the desk: its float stays.
+        assert_eq!(l.float_rect(13), Some(LRect::new(2000.0, 100.0, 400.0, 300.0)));
+        // A's float, merged in, stays too.
+        assert_eq!(l.float_rect(5), Some(LRect::new(300.0, 200.0, 400.0, 300.0)));
+        assert_eq!(sorted(set.all_clients()), vec![1, 5, 10, 11, 12, 13, 14]);
+    }
+
+    #[test]
+    fn named_set_losing_a_screen_debounces_through_screen_rects_for() {
+        let mut set = two_screens();
+        assert!(set.is_named());
+        let desk_a = RA;
+        let names = vec![n("A")];
+        let geoms = vec![RA];
+        let new = screen_rects_for(per_screen_enabled(true, false), set.is_named(), &names, &geoms, desk_a);
+        assert_eq!(new, vec![(n("A"), RA)]);
+        set.reconcile(&new, Some("A"), 10.0, GAP, RB, GO);
+        assert_eq!(set.screens.len(), 2);
+        assert_eq!(set.live_count(), 1);
+        assert_eq!(set.screens[1].name, "B");
+        assert_eq!(sorted(set.screens[1].layout.all_clients()), vec![10, 11, 12, 13, 14]);
+        set.reconcile(&new, Some("A"), 11.5, GAP, RB, GO);
+        assert_eq!(set.live_count(), 1);
+        assert_eq!(set.screens.len(), 2);
+        set.reconcile(&new, Some("A"), 12.0, GAP, RB, GO);
+        assert_eq!(set.screens.len(), 1);
+        assert_eq!(set.live_count(), 1);
+        assert_eq!(sorted(set.all_clients()), vec![1, 10, 11, 12, 13, 14]);
+        assert!(set.is_named());
+    }
+
+    #[test]
+    fn an_empty_input_changes_nothing() {
+        let mut set = two_screens();
+        set.reconcile(&[], Some("A"), 10.0, GAP, RB, GO);
+        set.reconcile(&[], Some("A"), 20.0, GAP, RB, GO);
+        assert_eq!(set.live_count(), 2);
+        assert_eq!(sorted(set.screens[1].layout.all_clients()), vec![10, 11, 12, 13, 14]);
+    }
+
+    #[test]
+    fn pending_screens_are_never_active_or_movable() {
+        let mut set = two_screens();
+        set.reconcile(&[(n("A"), RA)], Some("A"), 10.0, GAP, RB, GO);
+        assert_eq!(set.live_count(), 1);
+        // 10 sits on the pending B.
+        assert_eq!(set.screen_of(10), Some(1));
+        assert_eq!(set.activate_screen_of(10), None);
+        assert_eq!(set.active, 0);
+        assert_eq!(set.move_to_screen(10, true, GAP, RB, GO), None);
+        assert_eq!(set.on_pointer(2500.0, 100.0), None);
+        assert_eq!(set.active, 0);
+        assert_eq!(set.activate_screen_of(1), Some(0));
+    }
+
+    #[test]
+    fn activate_screen_of_switches_to_a_live_screen() {
+        let mut set = two_screens();
+        assert_eq!(set.activate_screen_of(12), Some(1));
+        assert_eq!(set.active, 1);
+        assert_eq!(set.activate_screen_of(99), None);
+        assert_eq!(set.active, 1);
     }
 }
