@@ -5746,13 +5746,17 @@ impl CxVulkan {
             // from the previous due time rather than from now, so peers get
             // a steady rate instead of drifting later each frame; resync to
             // now when more than one interval behind (e.g. after a stall).
+            // Capped at `now`: an explicit capture can draw faster than the
+            // peers' refresh (it bypasses the "due" gate above), and without
+            // the cap the stamp would run ahead of real time, starving the
+            // peers of frames for the accumulated drift once the capture stops.
             let now = Instant::now();
             direct.unpaced_frame_at = Some(
                 match (direct.unpaced_frame_at, self.direct_peer_refresh_interval(direct)) {
                     (Some(prev), Some(interval))
                         if now.saturating_duration_since(prev) <= interval * 2 =>
                     {
-                        prev + interval
+                        (prev + interval).min(now)
                     }
                     _ => now,
                 },
