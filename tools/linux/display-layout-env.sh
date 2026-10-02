@@ -1,7 +1,7 @@
 # tools/linux/display-layout-env.sh
 #
-# Sourced by a window manager session script (tools/arch_usb/wm-session.sh,
-# nebmind's makepad-wm-session) before `target/release/makepad-app-wm` is
+# Sourced by a window manager session script (e.g.
+# tools/arch_usb/wm-session.sh) before `target/release/makepad-app-wm` is
 # exec'd, to turn the saved
 #   ${XDG_CONFIG_HOME:-$HOME/.config}/makepad/wm/display-layout
 # file into the env vars the platform reads before Event::Startup
@@ -12,9 +12,8 @@
 #   MAKEPAD_DRM_MODES                per-screen modes
 #   MAKEPAD_VULKAN_COMPOSITOR_PCI    the render-on GPU's PCI address
 #
-# File format and the screen-key resolution rule are
-# apps/wm/src/shell/display_layout.rs (the pure model) and
-# docs/research/2026-10-02-wm-display-panel-map.md §3.1/§3.3. A screen's
+# File format and the screen-key resolution rule are in
+# apps/wm/src/shell/display_layout.rs (the pure model). A screen's
 # key is (card PCI address, connector name without its `cardN-` prefix);
 # resolving it to this boot's name means finding the card whose PCI
 # address (the basename of `readlink -f /sys/class/drm/cardN/device`)
@@ -36,8 +35,8 @@
 #
 # Each of the three env vars above is exported only when it is currently
 # unset or empty -- an externally set, non-empty value always wins over
-# the file, matching the rule the WM itself applies
-# (docs/research/...#3.2, "An externally set env var wins").
+# the file, matching the rule the WM's own runtime restore applies
+# (apps/wm/src/shell/display_layout.rs:env_restore_plan).
 #
 # `render-on` is read from `display-layout` when that file exists (even
 # if it has no `render-on` line, meaning "Auto": no fallback then). When
@@ -63,9 +62,9 @@
 # Order op entirely while `order_env` is pinned, and a screen's Mode op
 # while that screen's name appears in a pinned `modes_env` -- the same
 # "an externally set env var always wins" rule this helper already
-# applies at session start, now honoured by the WM's own safety-net
-# restore too (review 2026-10-02, I1). Both markers are always unset
-# first, same reason as the GPU one.
+# applies at session start, also honoured by the WM's own safety-net
+# restore. Both markers are always unset first, same reason as the GPU
+# one.
 #
 # One line per export/skip decision is logged to stderr, prefixed
 # `display-layout:`.

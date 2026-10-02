@@ -33,6 +33,38 @@
 //! `display-gpu` files; [`DisplayLayout::migrate`] reads them once to
 //! build the first saved layout.
 //!
+//! # Applying the saved layout before start-up
+//!
+//! The renderer reads its environment before `Event::Startup`
+//! (`platform/src/os/linux/vulkan_linux.rs::new_direct`), so the WM
+//! cannot apply this file to its own process in time by calling into
+//! itself. A session script run before the WM binary is exec'd
+//! (`tools/linux/display-layout-env.sh`) turns the file into
+//! `MAKEPAD_DISPLAY_ORDER`, `MAKEPAD_DRM_MODES` and
+//! `MAKEPAD_VULKAN_COMPOSITOR_PCI`/`_UUID`, each exported only when not
+//! already set from outside, with a matching `MAKEPAD_WM_ORDER_FROM_SAVED`
+//! / `MAKEPAD_WM_MODES_FROM_SAVED` / `MAKEPAD_WM_GPU_FROM_SAVED` marker so
+//! the running WM can tell "the script applied the saved value" from "this
+//! was pinned from outside" (`SystemSnapshot::order_env`/`modes_env`/
+//! `gpu_env`, `system_linux.rs`). An externally pinned, non-empty value
+//! always wins over the file, both at session start (the script's own
+//! check) and at runtime (`env_restore_plan`, above) — the WM's own
+//! restore is a safety net for drift the script's one-shot export cannot
+//! catch (e.g. the DRM/KMS state settling after the script ran).
+//!
+//! # Restart contract
+//!
+//! Saving a layout that moves the render-on GPU needs the renderer
+//! restarted on the new choice, which the process cannot do to itself:
+//! `restart_gate` (`linux_controls.rs`) asks the UI to confirm, and
+//! `Event::Shutdown` then exits with code 75 (`EX_TEMPFAIL`) instead of
+//! 0. A session manager
+//! that runs the WM as a service treats that code as a request to relaunch
+//! it, not a crash (`systemd`'s `RestartForceExitStatus=75`/
+//! `SuccessExitStatus=75`, `tools/arch_usb/makepad-wm.service`); the next
+//! launch re-reads `display-layout` through the same session script, so
+//! the new GPU choice is already in the environment on the way up.
+//!
 //! Compiled for Linux only (the inner `cfg` below makes the module empty
 //! elsewhere), so no other platform's behaviour changes.
 
@@ -543,12 +575,12 @@ pub fn restore_plan(layout: &DisplayLayout, snap: &LinuxDisplaySnapshot) -> Vec<
 /// unaffected (a person's `DisplayOrder`/`DisplayMode` action calls
 /// `Cx::linux_set_display_*` directly, never through this plan).
 ///
-/// This is the runtime half of the global constraint "an externally set
-/// non-empty env var always wins over the file in the session helper":
-/// before this (review 2026-10-02, I1) the helper already deferred to a
-/// pinned var at session start, but the WM's own restore did not, so a
-/// pinned env and a disagreeing file produced two layouts per boot (the
-/// env's for the first frame, then the file's once the restore ran).
+/// This is the runtime half of the constraint "an externally set
+/// non-empty env var always wins over the file": the session helper
+/// already defers to a pinned var at session start, and without this the
+/// WM's own restore did not, so a pinned env and a disagreeing file
+/// produced two layouts per boot (the env's for the first frame, then the
+/// file's once the restore ran).
 pub fn env_restore_plan(plan: Vec<RestoreOp>, order_env: Option<&str>, modes_env: Option<&str>) -> Vec<RestoreOp> {
     let order_pinned = order_env.is_some_and(|value| !value.is_empty());
     let mode_pinned: Vec<String> = modes_env
@@ -1024,7 +1056,7 @@ mod tests {
     }
 
     // env_restore_plan: env present/absent/empty crossed with the plan
-    // having something to filter, per var (I1's follow-up fix).
+    // having something to filter, per var.
 
     fn full_plan() -> Vec<RestoreOp> {
         vec![

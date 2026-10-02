@@ -3,8 +3,7 @@
 //! Nothing here touches a `Cx` or any platform type: every function takes
 //! plain `LRect`s and primitives, so it unit-tests without a display and
 //! without the GPU. The gate that decides whether per-screen behaviour runs
-//! at all (`per_screen_enabled`) is a pure function for the same reason —
-//! see `docs/research/2026-10-02-wm-per-screen-map.md` §4.
+//! at all (`per_screen_enabled`) is a pure function for the same reason.
 //!
 //! Coordinate space: the same window-coordinate space as `MouseEvent.abs`
 //! and the WM's own `LRect` (see `layout.rs`). On Linux direct this is the
@@ -18,8 +17,7 @@ use makepad_wm_api::{screens_in_window, span_rect, ScreenSpan, SpanError, WmEven
 use crate::layout::{transfer_client, ClientId, Detached, FullscreenMode, LRect, WmLayout, SCRATCHPAD};
 
 /// How long (seconds) a screen name must stay missing before its windows
-/// migrate (map §6.3 rule 5): mode changes and `active=false` flaps must
-/// not scatter windows.
+/// migrate: mode changes and `active=false` flaps must not scatter windows.
 pub const REMOVAL_DEBOUNCE: f64 = 2.0;
 
 /// Running the Linux direct backend and not the gallery. Otherwise
@@ -752,7 +750,7 @@ impl ScreenSet {
     }
 
     /// Bring the set in line with the screens now published (`new`, left to
-    /// right, from `screen_rects_for`). `now` is in seconds. See map §6.3:
+    /// right, from `screen_rects_for`). `now` is in seconds. Rules:
     /// - same name: layout kept, floats moved with the screen and fitted;
     /// - the old single `""` entry is renamed to `main_name` (else the
     ///   first new name), never migrated;
@@ -1590,7 +1588,7 @@ mod tests {
         assert_eq!(set.active, 1);
         // The mouse hasn't physically moved -- it's still over A. A
         // MouseMove at the same spot is not a crossing (the pointer never
-        // left A), so it must not undo the keyboard move (task 4's I1 fix).
+        // left A), so it must not undo the keyboard move.
         assert_eq!(set.on_pointer(100.0, 100.0), None);
         assert_eq!(set.active, 1);
     }
@@ -1849,7 +1847,7 @@ mod tests {
         assert_eq!(set.active, 1);
     }
 
-    // --- Task 7: surfaces on the active screen, the dock on the main ----
+    // --- Surfaces on the active screen, the dock on the main screen ----
 
     #[test]
     fn one_screen_gives_no_surface_or_dock_target() {

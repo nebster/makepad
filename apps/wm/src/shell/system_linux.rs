@@ -79,11 +79,11 @@
 //!   externally pinned, non-empty `MAKEPAD_DISPLAY_ORDER` /
 //!   `MAKEPAD_DRM_MODES` (its own marker unset) is `order_env` /
 //!   `modes_env`, which the runtime restore (`linux_controls.rs`) must
-//!   not override, the same rule the session script itself applies
-//!   (review 2026-10-02, I1: an external env var wins over the file at
-//!   both session start and runtime, never only the first). The worker
-//!   also lists the GPUs from `/sys/class/drm` (PCI ids, driver,
-//!   connected connectors) so the panel can offer only usable ones.
+//!   not override, the same rule the session script itself applies: an
+//!   external env var wins over the file at both session start and
+//!   runtime, never only the first. The worker also lists the GPUs from
+//!   `/sys/class/drm` (PCI ids, driver, connected connectors) so the panel
+//!   can offer only usable ones.
 //! * Pointer speed: mouse and touchpad multipliers as integer hundredths
 //!   (`100` = 1.00×, range 25..=300) in `mouse-speed` and `touchpad-speed`
 //!   beside the display files, same read/write rules
@@ -617,7 +617,7 @@ pub struct SystemSnapshot {
     /// unset/empty or a script-applied saved order. The runtime restore
     /// (`display_layout::env_restore_plan`) must not reorder the desktop
     /// while this is `Some`: the external value already won at session
-    /// start and keeps winning (review 2026-10-02, I1).
+    /// start and keeps winning.
     pub order_env: Option<String>,
     /// External, non-empty `MAKEPAD_DRM_MODES` (the raw
     /// `name=mode,name=mode` text) this process was started with, unless

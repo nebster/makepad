@@ -278,8 +278,9 @@ impl LinuxControls {
     /// boot is neither sent nor counted as outstanding — the restore can
     /// still end on the env's arrangement, matching the global
     /// constraint "an externally set non-empty env var always wins over
-    /// the file", which otherwise only held at session start (review
-    /// 2026-10-02, I1).
+    /// the file" — previously this only held at session start (the
+    /// session helper's own `MAKEPAD_WM_*_FROM_SAVED` deferral); this
+    /// extends it to the WM's own runtime restore.
     fn order_restore_step(
         &mut self,
         layout: &DisplayLayout,
@@ -1313,8 +1314,8 @@ mod tests {
         }
     }
 
-    /// nebmind: the AMD card (0c:00.0) is a peer, the NVIDIA card renders.
-    const NEBMIND_LAYOUT: &str =
+    /// Two-card layout: the AMD card (0c:00.0) is a peer, the NVIDIA card renders (main).
+    const TWO_GPU_LAYOUT: &str =
         "screen 0000:0c:00.0 HDMI-A-2 mode=3840x2160@30\nscreen 0000:01:00.0 HDMI-A-1 main\n";
 
     /// One poll of the order/mode restore against `snap`, no env pin.
@@ -1328,7 +1329,7 @@ mod tests {
 
     #[test]
     fn order_restore_outlives_a_mode_reacquire_of_a_peer() {
-        let layout = layout(NEBMIND_LAYOUT);
+        let layout = layout(TWO_GPU_LAYOUT);
         let mut c = LinuxControls::default();
         let own = screen("card1-HDMI-A-1", "0000:01:00.0", Some((0, 0)), true);
         // Generation 1: the peer cannot show its fastest mode yet (failed,
@@ -1369,7 +1370,7 @@ mod tests {
         // Peer placed (at 4K60, still at (0, 0) before its slice) -> mode
         // sent -> unplaced while reacquiring -> placed again on the right:
         // the order is still sent and the restore ends only once it holds.
-        let layout = layout(NEBMIND_LAYOUT);
+        let layout = layout(TWO_GPU_LAYOUT);
         let mut c = LinuxControls::default();
         let own = screen("card1-HDMI-A-1", "0000:01:00.0", Some((0, 0)), true);
         let mut peer = screen("card0-HDMI-A-2", "0000:0c:00.0", Some((0, 0)), false);
@@ -1395,9 +1396,10 @@ mod tests {
         assert!(c.layout_restore_done);
     }
 
-    // I1's runtime half: an externally pinned MAKEPAD_DISPLAY_ORDER /
-    // MAKEPAD_DRM_MODES must not be overridden by the file, the same way
-    // the session helper already defers to it at session start.
+    // The runtime half of the same rule: an externally pinned
+    // MAKEPAD_DISPLAY_ORDER / MAKEPAD_DRM_MODES must not be overridden by
+    // the file, the same way the session helper already defers to it at
+    // session start.
 
     #[test]
     fn order_restore_step_skips_order_pinned_by_an_external_env() {
@@ -1425,7 +1427,7 @@ mod tests {
 
     #[test]
     fn order_restore_step_skips_a_mode_pinned_by_an_external_env_for_its_screen_only() {
-        let layout = layout(NEBMIND_LAYOUT);
+        let layout = layout(TWO_GPU_LAYOUT);
         let own = screen("card1-HDMI-A-1", "0000:01:00.0", Some((0, 0)), true);
         let mut peer = screen("card0-HDMI-A-2", "0000:0c:00.0", None, false);
         peer.status = "failed: no free display plane can present the selected mode".to_string();
