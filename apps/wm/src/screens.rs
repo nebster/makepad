@@ -166,7 +166,8 @@ pub struct ScreenSet {
     /// The pointer / explicit-focus screen: new windows, menus and
     /// workspace keys act here. Always a live screen.
     pub active: usize,
-    /// The primary screen (dock), from `main_name`, else 0.
+    /// The primary screen, from `main_name`, else 0. The dock sits here, so
+    /// `reserved_bottom` (the dock's height) applies to this screen only.
     pub main: usize,
     /// In-session: the connector a migrated window came from, so it goes
     /// back when that screen returns.
@@ -275,6 +276,24 @@ impl ScreenSet {
         Some(i)
     }
 
+    /// The dock's reservation on screen `i`: the dock sits on the main
+    /// screen only, so every other screen keeps its full height.
+    pub fn reserved_for(&self, i: usize, reserved_bottom: f64) -> f64 {
+        if i == self.main {
+            reserved_bottom
+        } else {
+            0.0
+        }
+    }
+
+    /// Screen `i`'s tiling area (`screen_area` with the dock reserved only
+    /// on the main screen), never narrower or shorter than one point, like
+    /// the WM's single-desk area.
+    pub fn area(&self, i: usize, reserved_bottom: f64, gaps_out: f64) -> LRect {
+        let a = screen_area(self.screens[i].rect, self.reserved_for(i, reserved_bottom), gaps_out);
+        LRect::new(a.x, a.y, a.w.max(1.0), a.h.max(1.0))
+    }
+
     /// Indices of the screens that are really there (not waiting out the
     /// removal debounce), left to right.
     fn live(&self) -> Vec<usize> {
@@ -311,8 +330,9 @@ impl ScreenSet {
     /// had on a workspace that already had one.
     fn migrate_all(&mut self, src: usize, dst: usize, gap: f64, reserved_bottom: f64, gaps_out: f64) {
         let src_name = self.screens[src].name.clone();
+        let rb = self.reserved_for(dst, reserved_bottom);
         let (s, d) = two_mut(&mut self.screens, src, dst);
-        let area = screen_area(d.rect, reserved_bottom, gaps_out);
+        let area = screen_area(d.rect, rb, gaps_out);
         for ws in 0..=SCRATCHPAD {
             let taken = s.layout.take_workspace_clients(ws);
             if taken.is_empty() {
@@ -336,6 +356,7 @@ impl ScreenSet {
     /// are now (same workspace number) and leave `homes`.
     fn return_home(&mut self, dst: usize, gap: f64, reserved_bottom: f64, gaps_out: f64) {
         let name = self.screens[dst].name.clone();
+        let rb = self.reserved_for(dst, reserved_bottom);
         let mut back: Vec<ClientId> =
             self.homes.iter().filter(|(_, h)| **h == name).map(|(c, _)| *c).collect();
         back.sort();
@@ -347,7 +368,7 @@ impl ScreenSet {
             }
             let (s, d) = two_mut(&mut self.screens, src, dst);
             let Some(t) = s.layout.detach(c) else { continue };
-            let area = screen_area(d.rect, reserved_bottom, gaps_out);
+            let area = screen_area(d.rect, rb, gaps_out);
             place(s.rect, d, t.ws, t, area, gap);
         }
     }
@@ -387,6 +408,8 @@ impl ScreenSet {
             let keep = self
                 .index_of("")
                 .unwrap_or_else(|| self.main.min(self.screens.len() - 1));
+            // The survivor is the one desk, so the dock is on it.
+            self.main = keep;
             Self::set_rect(&mut self.screens[keep], new[0].1, reserved_bottom, gaps_out);
             for i in (0..self.screens.len()).rev() {
                 if i != keep {
@@ -408,12 +431,15 @@ impl ScreenSet {
             self.screens[0].name = main_name.unwrap_or(&new[0].0).to_string();
         }
 
+        // The dock (`reserved_bottom`) is on the main screen only.
+        let main_screen = main_name.unwrap_or(&new[0].0).to_string();
         let mut old = std::mem::take(&mut self.screens);
         let mut added = Vec::new();
         for (name, rect) in new {
             if let Some(i) = old.iter().position(|s| &s.name == name) {
                 let mut s = old.remove(i);
-                Self::set_rect(&mut s, *rect, reserved_bottom, gaps_out);
+                let rb = if *name == main_screen { reserved_bottom } else { 0.0 };
+                Self::set_rect(&mut s, *rect, rb, gaps_out);
                 self.screens.push(s);
             } else {
                 let mut layout = WmLayout::new();
@@ -480,6 +506,35 @@ impl ScreenSet {
         Some(i)
     }
 
+    /// A drag dropped `c` (a float or desktop-style window) over live
+    /// screen `to`: it moves there where it already is (no offset, only
+    /// fitted into `to`'s area), onto `to`'s active workspace, and `to`
+    /// becomes active. False when `c` is unknown, already on `to`, or on a
+    /// pending screen.
+    pub fn drop_on_screen(
+        &mut self,
+        c: ClientId,
+        to: usize,
+        gap: f64,
+        reserved_bottom: f64,
+        gaps_out: f64,
+    ) -> bool {
+        let live = self.live_count();
+        let Some(from) = self.screen_of(c) else { return false };
+        if to >= live || from >= live || from == to {
+            return false;
+        }
+        let rb = self.reserved_for(to, reserved_bottom);
+        let (s, d) = two_mut(&mut self.screens, from, to);
+        let area = screen_area(d.rect, rb, gaps_out);
+        if !transfer_client(&mut s.layout, &mut d.layout, c, (0.0, 0.0), area, gap) {
+            return false;
+        }
+        self.homes.remove(&c);
+        self.active = to;
+        true
+    }
+
     /// Move `c` to the next (or previous) live screen, wrapping, onto that
     /// screen's active workspace; the target becomes active and `c` its
     /// focus. `None` with one screen or when `c` is unknown.
@@ -502,9 +557,10 @@ impl ScreenSet {
         if to == from {
             return None;
         }
+        let rb = self.reserved_for(to, reserved_bottom);
         let (s, d) = two_mut(&mut self.screens, from, to);
         let offset = (d.rect.x - s.rect.x, d.rect.y - s.rect.y);
-        let area = screen_area(d.rect, reserved_bottom, gaps_out);
+        let area = screen_area(d.rect, rb, gaps_out);
         if !transfer_client(&mut s.layout, &mut d.layout, c, offset, area, gap) {
             return None;
         }
@@ -1060,6 +1116,74 @@ mod tests {
         assert_eq!(set.on_pointer(2500.0, 100.0), None);
         assert_eq!(set.active, 0);
         assert_eq!(set.activate_screen_of(1), Some(0));
+    }
+
+    #[test]
+    fn the_dock_is_reserved_on_the_main_screen_only() {
+        let mut set = ScreenSet::new(WmLayout::new(), DESK);
+        set.reconcile(&ab(), Some("B"), 0.0, GAP, 60.0, 10.0);
+        assert_eq!(set.main, 1);
+        assert_eq!(set.reserved_for(0, 60.0), 0.0);
+        assert_eq!(set.reserved_for(1, 60.0), 60.0);
+        assert_eq!(set.area(0, 60.0, 10.0), screen_area(RA, 0.0, 10.0));
+        assert_eq!(set.area(1, 60.0, 10.0), screen_area(RB_, 60.0, 10.0));
+        // A float as tall as the screen moved onto the non-main screen is
+        // fitted into the full height there, not one shortened by the dock.
+        let tall = LRect::new(2000.0, 10.0, 400.0, 1060.0);
+        set.screens[1].layout.add_float(5, tall, 0);
+        set.active = 1;
+        assert_eq!(set.move_to_screen(5, true, GAP, 60.0, 10.0), Some(0));
+        assert_eq!(set.screens[0].layout.float_rect(5).map(|r| r.h), Some(1060.0));
+    }
+
+    #[test]
+    fn the_merged_desk_is_main_and_keeps_the_dock() {
+        let mut set = two_screens();
+        set.reconcile(&ab(), Some("B"), 1.0, GAP, RB, GO);
+        assert_eq!(set.main, 1);
+        set.reconcile(&[(n(""), DESK)], None, 2.0, GAP, RB, GO);
+        assert_eq!(set.main, 0);
+        assert_eq!(set.reserved_for(0, 60.0), 60.0);
+    }
+
+    #[test]
+    fn a_single_fallback_entry_tiles_like_the_bare_layout() {
+        // Single-screen invariance: one "" entry over the desk hands out
+        // exactly the tile rects the bare WmLayout does for the same area.
+        let area = LRect::new(10.0, 36.0, 1900.0, 1000.0);
+        let gap = 8.0;
+        let mut bare = WmLayout::new();
+        let mut inner = WmLayout::new();
+        for c in 1..=4 {
+            bare.insert(c, area, gap);
+            inner.insert(c, area, gap);
+        }
+        bare.add_float(9, LRect::new(300.0, 200.0, 400.0, 300.0), 0);
+        inner.add_float(9, LRect::new(300.0, 200.0, 400.0, 300.0), 0);
+        let set = ScreenSet::new(inner, DESK);
+        assert_eq!(set.live_count(), 1);
+        assert_eq!(set.active_layout().rects(area, gap), bare.rects(area, gap));
+        assert_eq!(set.active_layout().groups(area, gap).len(), bare.groups(area, gap).len());
+        // The fallback's own area is the WM's single-desk area.
+        assert_eq!(set.area(0, 60.0, 10.0), screen_area(DESK, 60.0, 10.0));
+    }
+
+    #[test]
+    fn a_float_dropped_over_another_screen_moves_there_in_place() {
+        let mut set = two_screens();
+        // Float 13 (on B) was dragged so its centre sits over A.
+        set.screens[1].layout.set_float_rect(13, LRect::new(300.0, 100.0, 400.0, 300.0));
+        assert!(set.drop_on_screen(13, 0, GAP, RB, GO));
+        assert_eq!(set.screen_of(13), Some(0));
+        assert_eq!(set.active, 0);
+        assert_eq!(
+            set.screens[0].layout.float_rect(13),
+            Some(LRect::new(300.0, 100.0, 400.0, 300.0))
+        );
+        // Already there, unknown, or a screen that is not live: nothing.
+        assert!(!set.drop_on_screen(13, 0, GAP, RB, GO));
+        assert!(!set.drop_on_screen(99, 1, GAP, RB, GO));
+        assert!(!set.drop_on_screen(13, 5, GAP, RB, GO));
     }
 
     #[test]

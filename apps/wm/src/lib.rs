@@ -724,6 +724,9 @@ pub struct DragState {
     /// swapping the two, so the flag has to be read from the drag's own
     /// events, not from the keyboard state at some later moment.
     shift: bool,
+    /// The screen whose layout holds the window: the drag moves and
+    /// resizes it there, whatever screen the pointer crosses.
+    screen: usize,
 }
 
 /// Hyprland's `binds:drag_threshold` (DragController.cpp:346).
@@ -744,6 +747,8 @@ pub struct DividerDrag {
     /// exactly under the pointer.
     hit: DividerHit,
     start: Vec2d,
+    /// The screen whose layout owns the split.
+    screen: usize,
 }
 
 impl App {
@@ -780,7 +785,28 @@ impl App {
         self.state.as_mut().expect("state after startup")
     }
 
+    /// The active screen's tiling area: where new windows, previews and
+    /// the keyboard's layout actions go.
     fn desk_area(&self, cx: &mut Cx) -> LRect {
+        let active = self.state.as_ref().map_or(0, |s| s.screens.active);
+        self.screen_area(cx, active)
+    }
+
+    /// Screen `i`'s tiling area on the multi-screen desktop (the dock only
+    /// reserved on the main screen); otherwise the one desk's area. A
+    /// mobile style lays out across the whole desk, as today.
+    fn screen_area(&self, cx: &mut Cx, i: usize) -> LRect {
+        if let Some(s) = self
+            .state
+            .as_ref()
+            .filter(|s| s.per_screen() && !s.style.target.mobile() && i < s.screens.live_count())
+        {
+            return s.screens.area(i, s.style.reserved_height(), s.gaps_out);
+        }
+        self.single_desk_area(cx)
+    }
+
+    fn single_desk_area(&self, cx: &mut Cx) -> LRect {
         let desk = self.desk(cx);
         let rect = desk
             .borrow_mut::<WmDesk>()
@@ -1411,9 +1437,9 @@ impl App {
             WmRequest::SetFloating { floating } => {
                 let area = self.desk_area(cx);
                 let gap = self.state_mut().gap;
-                let is_float = self.state_mut().layout().is_float(client);
+                let is_float = self.state_mut().layout_of(client).is_float(client);
                 if is_float != *floating {
-                    self.state_mut().layout_mut().toggle_float(client, area, gap);
+                    self.state_mut().layout_of_mut(client).toggle_float(client, area, gap);
                     self.redraw_all(cx);
                 }
             }
@@ -1643,7 +1669,7 @@ impl App {
         // Out of the layout, but NOT out of the desk: `WmDesk::remove_client`
         // would drop the tile widget (and with it the child's swapchain and
         // this viewer's warmth) once its close animation finished.
-        self.state_mut().layout_mut().remove(active.client);
+        self.state_mut().layout_of_mut(active.client).remove(active.client);
         log!(
             "wm: preview hide client {} ({}), viewer stays warm",
             active.client,
@@ -1730,7 +1756,7 @@ impl App {
         }
         // Out of the layout now: the tiles reflow and the desk plays the
         // popin-out with the frame the tile already has.
-        self.state_mut().layout_mut().remove(client);
+        self.state_mut().layout_of_mut(client).remove(client);
         if let Some(mut desk) = self.desk(cx).borrow_mut::<WmDesk>() {
             desk.remove_client(client);
         }
@@ -1814,7 +1840,7 @@ impl App {
         if let Some(app) = self.state_mut().phone.tiles.forget_client(client) {
             log!("wm: home tile {} lost client {}", app, client);
         }
-        self.state_mut().layout_mut().remove(client);
+        self.state_mut().layout_of_mut(client).remove(client);
         self.state_mut().clients.remove(&client);
         // A dying warm viewer (or its requester) clears the cache's
         // reference to it — "if a viewer process dies clear its slot, so
@@ -1884,6 +1910,9 @@ impl App {
                 }
             }
         }
+        // A window on another screen makes that screen the active one
+        // first (a click, a bar entry, move-to-screen with follow).
+        self.state_mut().screens.activate_screen_of(client);
         if let Some(ws) = self.state_mut().layout().workspace_of(client) {
             let state = self.state_mut();
             if ws != state.layout().active {
@@ -2642,7 +2671,7 @@ impl App {
             .clients
             .iter()
             .filter(|(id, s)| {
-                !s.warm && !s.pane && s.closing.is_none() && state.layout().workspace_of(**id).is_some()
+                !s.warm && !s.pane && s.closing.is_none() && state.screens.screen_of(**id).is_some()
             })
             .map(|(id, s)| (*id, s.app.clone()))
             .collect();
@@ -2678,7 +2707,7 @@ impl App {
                     && !s.warm
                     && !s.pane
                     && s.closing.is_none()
-                    && state.layout().workspace_of(**id).is_some()
+                    && state.screens.screen_of(**id).is_some()
             })
             .map(|(id, _)| *id)
             .collect();
@@ -3634,19 +3663,62 @@ impl App {
 
     /// Hand the layout the true desk rect so fullscreen and the scratchpad
     /// console can reach past the outer gap.
-    fn sync_geometry(&mut self, cx: &mut Cx) {
+    /// True when the screen set was reconciled (multi-screen only).
+    fn sync_geometry(&mut self, cx: &mut Cx) -> bool {
         let rect = self
             .desk(cx)
             .borrow_mut::<WmDesk>()
             .map(|d| d.desk_rect)
             .unwrap_or_default();
         if rect.size.x > 1.0 {
-            self.state_mut().layout_mut().set_outer(LRect::new(
-                rect.pos.x,
-                rect.pos.y,
-                rect.size.x,
-                rect.size.y,
-            ));
+            let desk = LRect::new(rect.pos.x, rect.pos.y, rect.size.x, rect.size.y);
+            let state = self.state_mut();
+            // Per screen, reconcile hands each layout its screen as outer.
+            let changed = state.sync_screens(desk, host::now());
+            if !state.per_screen() {
+                state.layout_mut().set_outer(desk);
+            }
+            return changed;
+        }
+        false
+    }
+
+    /// Read the platform's screens (Linux direct only; elsewhere the WM
+    /// keeps its single desk) and bring the screen set in line. Called on
+    /// WindowGeomChange and the 1 s tick: the tick is also what lets a
+    /// lost screen's removal debounce expire.
+    fn sync_screens(&mut self, cx: &mut Cx) {
+        if self.state.is_none() {
+            return;
+        }
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+        {
+            let per_screen = screens::per_screen_enabled(matches!(cx.os_type(), OsType::LinuxDirect), self.gallery);
+            let generation = cx.linux_display_generation();
+            let state = self.state_mut();
+            if per_screen != state.screen_source.per_screen || generation != state.screen_source.generation || per_screen {
+                let geoms = makepad_widgets::makepad_platform::screens();
+                let names = makepad_widgets::makepad_platform::linux_screen_names();
+                let main_name = geoms
+                    .iter()
+                    .position(|g| g.is_primary)
+                    .and_then(|i| names.get(i).cloned());
+                state.screen_source = desk::ScreenSource {
+                    per_screen,
+                    geoms: geoms
+                        .iter()
+                        .map(|g| LRect::new(g.bounds.pos.x, g.bounds.pos.y, g.bounds.size.x, g.bounds.size.y))
+                        .collect(),
+                    names,
+                    main_name,
+                    generation,
+                };
+            }
+        }
+        if self.sync_geometry(cx) {
+            self.sync_bar_for_fullscreen(cx);
+            self.update_bar(cx);
+            self.redraw_all(cx);
         }
     }
 
@@ -3669,7 +3741,9 @@ impl App {
             self.request_close(cx, client);
         }
         self.preview_cache.clear();
-        self.state_mut().layout_mut().switch_workspace(0);
+        for s in &mut self.state_mut().screens.screens {
+            s.layout.switch_workspace(0);
+        }
         self.redraw_all(cx);
     }
 
@@ -3690,14 +3764,35 @@ impl App {
         self.preview_cache.clear();
     }
 
+    /// The pointer is at `abs`: crossing into another screen makes it the
+    /// active one and (Hyprland `follow_mouse` across monitors) gives that
+    /// screen's focused window the keyboard, unless the AI pane holds it.
+    /// Hover within a screen never changes focus.
+    fn pointer_screen(&mut self, cx: &mut Cx, abs: Vec2d) {
+        let Some(i) = self.state_mut().screens.on_pointer(abs.x, abs.y) else {
+            return;
+        };
+        if !self.ai_pane_is_open(cx) {
+            if let Some(c) = self.state_mut().layout_at(i).focused_client() {
+                self.focus_client(cx, c);
+                return;
+            }
+        }
+        self.update_bar(cx);
+        self.redraw_all(cx);
+    }
+
     /// SUPER+F hides the bar with the window; anything that leaves
     /// fullscreen puts it back, unless SUPER+SHIFT+SPACE hid it.
     fn sync_bar_for_fullscreen(&mut self, cx: &mut Cx) {
         let fullscreen = {
-            let layout = self.state_mut().layout();
+            let state = self.state_mut();
+            let several = state.screens.live_count() >= 2;
+            let layout = state.layout();
             let ws = layout.focus_ws();
             layout.workspaces[ws].fullscreen.is_some()
                 && layout.workspaces[ws].fullscreen_mode == FullscreenMode::Fullscreen
+                && !several
         };
         let bar = self.ui.widget(cx, ids!(bar));
         if fullscreen && bar.visible() {
@@ -3758,6 +3853,15 @@ impl App {
                 }
             }
             WmAction::Fullscreen(mode) => {
+                // Several screens share one bar strip, which cannot hide
+                // over one screen only: fullscreen maximizes within its
+                // screen and the bar stays (true per-screen fullscreen is
+                // a follow-up).
+                let mode = if mode == FullscreenMode::Fullscreen && self.state_mut().screens.live_count() >= 2 {
+                    FullscreenMode::Maximized
+                } else {
+                    mode
+                };
                 self.state_mut().layout_mut().toggle_fullscreen_mode(mode);
             }
             WmAction::TiledFullscreen => {
@@ -3912,11 +4016,13 @@ impl App {
 
     fn begin_drag(&mut self, cx: &mut Cx, abs: Vec2d, resize: bool) -> bool {
         self.sync_geometry(cx);
-        let area = self.desk_area(cx);
+        // The window under the pointer is on the screen under the pointer.
+        let screen = self.state_mut().screen_under(abs.x, abs.y);
+        let area = self.screen_area(cx, screen);
         let gap = self.state_mut().gap;
         let Some(client) = self
             .state_mut()
-            .layout()
+            .layout_at(screen)
             .client_at(abs.x, abs.y, area, gap)
         else {
             return false;
@@ -3936,9 +4042,11 @@ impl App {
         armed: bool,
     ) -> bool {
         self.sync_geometry(cx);
-        let area = self.desk_area(cx);
+        let state = self.state_mut();
+        let screen = state.screens.screen_of(client).unwrap_or(state.screens.active);
+        let area = self.screen_area(cx, screen);
         let gap = self.state_mut().gap;
-        let layout = self.state_mut().layout_mut();
+        let layout = self.state_mut().layout_at_mut(screen);
         let floating = layout.is_float(client);
         let Some(rect) = layout.rect_of(client, area, gap) else {
             return false;
@@ -3960,6 +4068,7 @@ impl App {
             grab_top: abs.y < cy_center,
             armed,
             shift: false,
+            screen,
         });
         if floating {
             // Hyprland moves a drag 1:1 with the pointer, not on the
@@ -4003,7 +4112,7 @@ impl App {
             }
             drag.armed = true;
             if !drag.resize {
-                if let Some(w)=self.state.as_mut().and_then(|s|s.layout_mut().desktop.get_mut(drag.client)).filter(|w|w.maximized || w.snap.is_some()) {
+                if let Some(w)=self.state.as_mut().and_then(|s|s.layout_of_mut(drag.client).desktop.get_mut(drag.client)).filter(|w|w.maximized || w.snap.is_some()) {
                     let anchor=((drag.start.x-drag.start_rect.x)/drag.start_rect.w).clamp(0.0,1.0);
                     w.rect.x=drag.start.x-w.rect.w*anchor;
                     w.rect.y=drag.start.y-16.0;
@@ -4022,8 +4131,15 @@ impl App {
             drag.grab_top,
         );
         let (resize_x,resize_y)=(drag.resize_x,drag.resize_y);
+        let screen = drag.screen;
         drag.last = abs;
-        let area = self.desk_area(cx);
+        if screen >= self.state_mut().screens.live_count() {
+            // The screen went away under the drag (a hotplug): drop it.
+            self.drag = None;
+            self.state_mut().dragging.clear();
+            return;
+        }
+        let area = self.screen_area(cx, screen);
         let gap = self.state_mut().gap;
         if floating {
             let d = abs - start;
@@ -4046,14 +4162,14 @@ impl App {
             } else {
                 LRect::new(start_rect.x + d.x, start_rect.y + d.y, start_rect.w, start_rect.h)
             };
-            self.state_mut().layout_mut().set_float_rect(client, rect);
+            self.state_mut().layout_at_mut(screen).set_float_rect(client, rect);
         } else if resize {
             // Tiled: the divider follows the pointer, one frame at a time,
             // exactly like CDwindleAlgorithm::resizeTarget's Δ.
             let d = abs - last;
             // A tiled resize moves the split ratios: the grabbed edge
             // follows the pointer, so a left/top grab inverts the delta.
-            let layout = self.state_mut().layout_mut();
+            let layout = self.state_mut().layout_at_mut(screen);
             if d.x.abs() > 0.0 {
                 layout.resize_px(Axis::Horizontal, d.x, area, gap);
             }
@@ -4071,10 +4187,9 @@ impl App {
             (d.client, d.floating, d.resize)
         };
         let hint = if shift && !floating && !resize {
-            let area = self.desk_area(cx);
             let gap = self.state_mut().gap;
             self.state_mut()
-                .layout()
+                .layout_at(screen)
                 .client_at(abs.x, abs.y, area, gap)
                 .filter(|target| *target != client)
         } else {
@@ -4099,28 +4214,52 @@ impl App {
         // together with the mouse often enough); the drag's own last known
         // state stands in for it.
         let shift = shift || drag.shift;
+        if drag.floating && !drag.resize && drag.armed && drag.screen < self.state_mut().screens.live_count() {
+            // A float or desktop-style window whose centre lands on another
+            // screen moves to that screen's layout, where it was dropped.
+            let area = self.screen_area(cx, drag.screen);
+            let state = self.state_mut();
+            let centre = state
+                .layout_at(drag.screen)
+                .rect_of(drag.client, area, state.gap)
+                .map(|r| r.center());
+            if let Some((x, y)) = centre {
+                let to = state.screen_under(x, y);
+                let (gap, reserved, gaps_out) = (state.gap, state.style.reserved_height(), state.gaps_out);
+                if to != drag.screen && state.screens.drop_on_screen(drag.client, to, gap, reserved, gaps_out) {
+                    self.focus_client(cx, drag.client);
+                }
+            }
+        }
         if drag.floating && !drag.resize && drag.armed && self.state_mut().style.target==desktop::DesktopStyle::Windows {
             let area=self.desk_area(cx);
             self.state_mut().snap.drag(drag.client,abs,area);
             if let Some(zone)=self.state_mut().snap.preview {
                 // Preserve the free window's size before the edge drag.
-                if let Some(w)=self.state_mut().layout_mut().desktop.get_mut(drag.client) {w.rect=drag.start_rect;}
+                if let Some(w)=self.state_mut().layout_of_mut(drag.client).desktop.get_mut(drag.client) {w.rect=drag.start_rect;}
                 self.apply_snap(cx,drag.client,zone);
             }
         }
         self.state_mut().snap.clear();
-        if !drag.floating && !drag.resize && drag.armed {
+        // A tiled window dropped on another screen snaps back (moving a
+        // tile across screens is move-to-screen's job).
+        if !drag.floating
+            && !drag.resize
+            && drag.armed
+            && drag.screen < self.state_mut().screens.live_count()
+            && self.state_mut().screen_under(abs.x, abs.y) == drag.screen
+        {
             // Tiled move: dropping on another tile swaps the two, which is
             // what Hyprland's `movewindow` drag settles into.
-            let area = self.desk_area(cx);
+            let area = self.screen_area(cx, drag.screen);
             let gap = self.state_mut().gap;
             if let Some(target) = self
                 .state_mut()
-                .layout()
+                .layout_at(drag.screen)
                 .client_at(abs.x, abs.y, area, gap)
             {
                 if target != drag.client {
-                    let layout = self.state_mut().layout_mut();
+                    let layout = self.state_mut().layout_at_mut(drag.screen);
                     if shift {
                         layout.group_drop(drag.client, target);
                     } else {
@@ -4144,26 +4283,27 @@ impl App {
     /// window behaves exactly as it always did.
     fn begin_divider_drag(&mut self, cx: &mut Cx, abs: Vec2d) -> bool {
         self.sync_geometry(cx);
-        let area = self.desk_area(cx);
+        let screen = self.state_mut().screen_under(abs.x, abs.y);
+        let area = self.screen_area(cx, screen);
         let gap = self.state_mut().gap;
         // A window under the pointer keeps its own press. `client_at`
         // covers floats and the scratchpad too, so anything drawn OVER a
         // gap shadows the divider the way it shadows the wallpaper.
         if self
             .state_mut()
-            .layout()
+            .layout_at(screen)
             .client_at(abs.x, abs.y, area, gap)
             .is_some()
         {
             return false;
         }
-        let Some(hit) = self.state_mut().layout().divider_at(abs.x, abs.y, area, gap) else {
+        let Some(hit) = self.state_mut().layout_at(screen).divider_at(abs.x, abs.y, area, gap) else {
             return false;
         };
         // Both sides of the split resize live: name every client under it
         // so `WmDesk` snaps their tiles instead of restarting the 379ms
         // layout tween on each pointer frame (see `WmState::dragging`).
-        let clients = self.state_mut().layout().clients_under(&hit);
+        let clients = self.state_mut().layout_at(screen).clients_under(&hit);
         log!(
             "wm: divider grab {:?} depth {} ratio {:.3} over {} tiles",
             hit.axis,
@@ -4172,7 +4312,7 @@ impl App {
             clients.len()
         );
         self.state_mut().dragging = clients;
-        self.div_drag = Some(DividerDrag { hit, start: abs });
+        self.div_drag = Some(DividerDrag { hit, start: abs, screen });
         self.apply_divider_cursor(cx, Some(hit.axis));
         true
     }
@@ -4181,7 +4321,12 @@ impl App {
         let Some(drag) = self.div_drag.as_ref() else {
             return;
         };
-        let (hit, start) = (drag.hit, drag.start);
+        let (hit, start, screen) = (drag.hit, drag.start, drag.screen);
+        if screen >= self.state_mut().screens.live_count() {
+            self.div_drag = None;
+            self.state_mut().dragging.clear();
+            return;
+        }
         let gap = self.state_mut().gap;
         let px = match hit.axis {
             Axis::Horizontal => abs.x - start.x,
@@ -4190,7 +4335,7 @@ impl App {
         // 1:1 with the pointer, always measured from the grab: no tween,
         // no accumulated delta, and a clamp at either end never eats part
         // of the way back.
-        self.state_mut().layout_mut().drag_divider_px(&hit, px, gap);
+        self.state_mut().layout_at_mut(screen).drag_divider_px(&hit, px, gap);
         self.apply_divider_cursor(cx, Some(hit.axis));
         self.redraw_all(cx);
     }
@@ -4213,18 +4358,19 @@ impl App {
         if self.state.is_none() || self.drag.is_some() || self.div_drag.is_some() {
             return;
         }
-        let area = self.desk_area(cx);
+        let screen = self.state_mut().screen_under(abs.x, abs.y);
+        let area = self.screen_area(cx, screen);
         let gap = self.state_mut().gap;
         let on_client = self
             .state_mut()
-            .layout()
+            .layout_at(screen)
             .client_at(abs.x, abs.y, area, gap)
             .is_some();
         let axis = if on_client {
             None
         } else {
             self.state_mut()
-                .layout()
+                .layout_at(screen)
                 .divider_at(abs.x, abs.y, area, gap)
                 .map(|hit| hit.axis)
         };
@@ -4265,9 +4411,12 @@ impl App {
     /// ordinary tiled SUPER-drag — drop it on another tile to swap, or
     /// with SHIFT to make it a tab there.
     fn tear_out_tab(&mut self, cx: &mut Cx, client: ClientId, abs: Vec2d) {
-        let area = self.desk_area(cx);
+        // The strip may be on any screen: tear out in the tab's own layout.
+        let state = self.state_mut();
+        let screen = state.screens.screen_of(client).unwrap_or(state.screens.active);
+        let area = self.screen_area(cx, screen);
         let gap = self.state_mut().gap;
-        if !self.state_mut().layout_mut().group_tear_out(client, area, gap) {
+        if !self.state_mut().layout_at_mut(screen).group_tear_out(client, area, gap) {
             return;
         }
         self.begin_drag_on(cx, client, abs, false, true);
@@ -4276,8 +4425,11 @@ impl App {
         self.redraw_all(cx);
     }
 
-    /// SUPER + wheel: `focus({ workspace = "e+1" / "e-1" })`.
-    fn scroll_workspace(&mut self, cx: &mut Cx, down: bool) {
+    /// SUPER + wheel: `focus({ workspace = "e+1" / "e-1" })`, on the
+    /// screen under the pointer.
+    fn scroll_workspace(&mut self, cx: &mut Cx, down: bool, abs: Vec2d) {
+        let state = self.state_mut();
+        state.screens.active = state.screen_under(abs.x, abs.y);
         let layout = self.state_mut().layout();
         let n = layout.cycle_occupied(layout.active, down);
         self.state_mut().layout_mut().switch_workspace(n);
@@ -4621,6 +4773,8 @@ impl MatchEvent for App {
                 crate::layout::WmLayout::new(),
                 LRect::new(0.0, 0.0, 1400.0, 860.0),
             ),
+            screen_source: Default::default(),
+            screen_key: Default::default(),
             dock_backdrop: None,
             clients: std::collections::HashMap::new(),
             hub_port,
@@ -5089,6 +5243,9 @@ impl AppMain for App {
             if Some(ev.window_id) == self.ui.window(cx, ids!(main_window)).window_id() {
                 self.dpi_factor = ev.new_geom.dpi_factor;
             }
+            // Screens added, removed, moved or rescaled (a DPI change does
+            // not bump the display generation, so this is the hook for it).
+            self.sync_screens(cx);
         }
         // The Linux controls watch the main window's geometry and their own
         // re-anchor frame (linux_controls.rs).
@@ -5145,6 +5302,17 @@ impl AppMain for App {
         {
             cx.set_cursor(MouseCursor::Default);
             return;
+        }
+        // Crossing into another screen makes it the active one (not
+        // mid-drag: a drag keeps its own screen until it drops).
+        if self.state.is_some()
+            && self.drag.is_none()
+            && self.div_drag.is_none()
+            && !self.state_mut().style.target.mobile()
+        {
+            if let Event::MouseMove(MouseMoveEvent { abs, .. }) | Event::MouseDown(MouseDownEvent { abs, .. }) = event {
+                self.pointer_screen(cx, *abs);
+            }
         }
         if self.phone_search_event(cx,event) {return;}
         if self.state.is_some() && self.phone_pointer(cx,event) {return;}
@@ -5206,7 +5374,7 @@ impl AppMain for App {
                 // SUPER + wheel over the desk cycles workspaces.
                 Event::Scroll(e) if super_chord(&e.modifiers) => {
                     if e.scroll.y.abs() > 0.5 {
-                        self.scroll_workspace(cx, e.scroll.y > 0.0);
+                        self.scroll_workspace(cx, e.scroll.y > 0.0, e.abs);
                     }
                     return;
                 }
@@ -5292,6 +5460,9 @@ impl AppMain for App {
                 self.explain_first_exec_scan(cx);
                 self.update_status(cx);
                 self.wifi_tick(cx);
+                // A hotplug published since, or a lost screen's removal
+                // debounce running out.
+                self.sync_screens(cx);
                 self.update_bar(cx);
                 // The pool fills itself here: at startup, after an
                 // adoption, and after any death it healed from. One spawn
