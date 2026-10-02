@@ -22,8 +22,11 @@ pub struct LinuxDisplayOutput {
     pub height: u32,
     /// Selected mode refresh in Hz (0.0 when no mode was selected).
     pub refresh_hz: f64,
-    /// The main screen: the dock, menus and new windows go here.
+    /// The main screen: the dock, menus and new windows go here. It may be
+    /// on any GPU.
     pub primary: bool,
+    /// The DRM card driving this connector, e.g. `card1`.
+    pub card: String,
     /// Top-left corner of this connector's rectangle in the wide desktop, in
     /// native pixels; `None` when it is not part of the desktop.
     pub desktop_position: Option<(u32, u32)>,
@@ -104,6 +107,21 @@ impl crate::cx::Cx {
         self.redraw_all();
         Ok(())
     }
+
+    /// Show the named output in `mode` (`"3840x2160"`, `"3840x2160@30"` or
+    /// `"3840x2160-30"`), or in its fastest native mode with `None`. The
+    /// output is reacquired at the next safe frame boundary, on whichever GPU
+    /// drives it; a mode it does not offer leaves it failed until changed.
+    pub fn linux_set_display_mode(&mut self, name: &str, mode: Option<&str>) -> Result<(), String> {
+        let vulkan = self
+            .os
+            .vulkan
+            .as_mut()
+            .ok_or_else(|| "the direct Vulkan renderer is not initialized".to_string())?;
+        vulkan.direct_request_display_mode(name, mode)?;
+        self.redraw_all();
+        Ok(())
+    }
 }
 
 #[cfg(not(all(not(gpusim), linux_direct, use_vulkan)))]
@@ -125,5 +143,10 @@ impl crate::cx::Cx {
     /// Only the direct Vulkan backend arranges displays.
     pub fn linux_set_display_order(&mut self, _order: &[String]) -> Result<(), String> {
         Err("cannot arrange displays: this build is not the direct Vulkan backend".to_string())
+    }
+
+    /// Only the direct Vulkan backend sets display modes.
+    pub fn linux_set_display_mode(&mut self, name: &str, _mode: Option<&str>) -> Result<(), String> {
+        Err(format!("cannot set the mode of {name}: this build is not the direct Vulkan backend"))
     }
 }
