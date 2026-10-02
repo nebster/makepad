@@ -211,6 +211,21 @@ pub struct FloatEntry {
     pub no_key_focus: bool,
 }
 
+/// A client taken out of one `WmLayout` (`detach`) with everything another
+/// layout needs to `adopt` it as it was: its workspace, its float rect (None
+/// when tiled), its desktop-style window (rect, minimized, maximized, snap),
+/// the `fullscreenstate 0 2` flag the app was told, and the Quick-Look
+/// "never takes key focus" flag.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Detached {
+    pub client: ClientId,
+    pub ws: usize,
+    pub float: Option<LRect>,
+    pub desk: Option<crate::desktop_layout::DesktopWindow>,
+    pub client_fullscreen: bool,
+    pub no_key_focus: bool,
+}
+
 /// A tabbed group: one tile slot holding N clients with one visible.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GroupInfo {
@@ -1691,7 +1706,7 @@ impl WmLayout {
             return false;
         }
         self.detach_tile(dragged);
-        // `detach` collapses the split it emptied, so every leaf index the
+        // `detach_tile` collapses the split it emptied, so every leaf index the
         // tree handed out a moment ago may have moved: look the target up
         // again rather than reusing `target_leaf`.
         let Some(root) = self.workspaces[ws].root else {
@@ -1971,23 +1986,26 @@ impl WmLayout {
 
     /// Take one client out of this layout entirely (the `remove` path:
     /// its tile, group tab, float, fullscreen and focus are all fixed up
-    /// as for a closed window). Returns the workspace it was on and, for
-    /// a float, its rect.
-    pub fn detach(&mut self, client: ClientId) -> Option<(usize, Option<LRect>)> {
+    /// as for a closed window), with the state `adopt` needs to put it back
+    /// somewhere else as it was.
+    pub fn detach(&mut self, client: ClientId) -> Option<Detached> {
         let ws = self.workspace_of(client)?;
-        let float = self
-            .floats
-            .iter()
-            .find(|f| f.client == client)
-            .map(|f| f.rect);
+        let entry = self.floats.iter().find(|f| f.client == client).copied();
+        let d = Detached {
+            client,
+            ws,
+            float: entry.map(|f| f.rect),
+            desk: self.desktop.get(client).cloned(),
+            client_fullscreen: self.is_client_fullscreen(client),
+            no_key_focus: entry.is_some_and(|f| f.no_key_focus),
+        };
         self.remove(client);
-        Some((ws, float))
+        Some(d)
     }
 
-    /// Detach every client on `ws` (tiled: None, float: Some(rect)), in
-    /// focus-history order, most recent last; never-focused clients come
-    /// first, in `clients_on` order.
-    pub fn take_workspace_clients(&mut self, ws: usize) -> Vec<(ClientId, Option<LRect>)> {
+    /// Detach every client on `ws`, in focus-history order, most recent
+    /// last; never-focused clients come first, in `clients_on` order.
+    pub fn take_workspace_clients(&mut self, ws: usize) -> Vec<Detached> {
         if ws >= self.workspaces.len() {
             return Vec::new();
         }
@@ -1998,32 +2016,54 @@ impl WmLayout {
             .filter(|c| !self.focus_history.contains(c))
             .collect();
         order.extend(self.focus_history.iter().copied().filter(|c| on.contains(c)));
-        order
-            .into_iter()
-            .filter_map(|c| self.detach(c).map(|(_, float)| (c, float)))
-            .collect()
+        order.into_iter().filter_map(|c| self.detach(c)).collect()
     }
 
-    /// Put a client that came from another layout on `ws`: tiled (the
-    /// normal insert path, at that workspace's focus) or as a float with
-    /// `float` as its rect. Either way it becomes that workspace's focus.
-    pub fn adopt(&mut self, ws: usize, client: ClientId, float: Option<LRect>, area: LRect, gap: f64) {
+    /// Put a client `detach`ed from another layout on `ws`: tiled (the
+    /// normal insert path, at that workspace's focus) or as a float. Its
+    /// float rect and desktop-style window are shifted by `offset` (the
+    /// target screen's origin minus the source's) and fitted inside `area`;
+    /// minimized/maximized/snap and the app-facing fullscreen flag come
+    /// with it. A tile arriving on a workspace showing another window
+    /// fullscreen or maximized clears that, so the new window is drawn.
+    /// It becomes that workspace's focus (a Quick-Look panel excepted).
+    pub fn adopt(&mut self, ws: usize, d: Detached, offset: (f64, f64), area: LRect, gap: f64) {
         if ws >= self.workspaces.len() {
             return;
         }
-        match float {
+        let carry = |r: LRect| fit_inside(LRect::new(r.x + offset.0, r.y + offset.1, r.w, r.h), area);
+        let c = d.client;
+        // The desktop-style window first, so `insert_on`'s `ensure` keeps it
+        // instead of cascading a fresh one.
+        self.desktop.windows.retain(|w| w.client != c);
+        if let Some(mut w) = d.desk {
+            w.rect = carry(w.rect);
+            self.desktop.windows.push(w);
+        }
+        match d.float {
             None => {
+                let w = &mut self.workspaces[ws];
+                if w.fullscreen.is_some_and(|f| f != c) {
+                    w.fullscreen = None;
+                    w.fullscreen_mode = FullscreenMode::None;
+                }
                 let (base, gap) = if ws == SCRATCHPAD {
                     (self.scratchpad_area(area, gap), 0.0)
                 } else {
                     (area, gap)
                 };
-                self.insert_on(ws, client, base, gap);
+                self.insert_on(ws, c, base, gap);
             }
-            Some(rect) => {
-                self.desktop.ensure(client, area);
-                self.add_float(client, rect, ws);
-            }
+            // A float with no desktop window (a Quick-Look panel) stays a
+            // native preview float: no `ensure`.
+            Some(rect) if d.no_key_focus => self.add_preview_float(c, carry(rect), ws),
+            Some(rect) => self.add_float(c, carry(rect), ws),
+        }
+        if d.client_fullscreen && !self.client_fullscreen.contains(&c) {
+            self.client_fullscreen.push(c);
+        }
+        if !d.no_key_focus {
+            self.note_focus(c);
         }
     }
 
@@ -2053,12 +2093,13 @@ pub(crate) fn fit_inside(mut r: LRect, area: LRect) -> LRect {
 }
 
 /// Move-to-screen: take `c` out of `from` (fixing that workspace's focus
-/// and fullscreen) and put it on `to`'s ACTIVE workspace, like Hyprland's
-/// `movewindow mon:+1` landing on the target monitor's visible workspace
-/// (a scratchpad client too). A float's rect, and the desktop-style rect,
+/// and fullscreen) and `adopt` it onto `to`'s ACTIVE workspace, like
+/// Hyprland's `movewindow mon:+1` landing on the target monitor's visible
+/// workspace (a scratchpad client too). Its float and desktop-style rects
 /// are shifted by `offset` (the target screen's origin minus the source's)
-/// and then fitted inside `to_area`. `c` becomes `to`'s focus. False when
-/// `c` is not in `from`.
+/// and fitted inside `to_area`. `c` becomes `to`'s focus, and an open
+/// scratchpad there closes so the focus really is `c`. False when `c` is
+/// not in `from`.
 pub fn transfer_client(
     from: &mut WmLayout,
     to: &mut WmLayout,
@@ -2067,25 +2108,13 @@ pub fn transfer_client(
     to_area: LRect,
     gap: f64,
 ) -> bool {
-    let desk = from.desktop.get(c).cloned();
-    let Some((_, float)) = from.detach(c) else {
+    let Some(d) = from.detach(c) else {
         return false;
     };
-    let carry = |r: LRect| {
-        fit_inside(
-            LRect::new(r.x + offset.0, r.y + offset.1, r.w, r.h),
-            to_area,
-        )
-    };
     let ws = to.active;
-    to.adopt(ws, c, float.map(carry), to_area, gap);
-    if let Some(mut w) = desk {
-        w.rect = carry(w.rect);
-        to.desktop.windows.retain(|x| x.client != c);
-        to.desktop.windows.push(w);
-    }
+    to.adopt(ws, d, offset, to_area, gap);
+    to.scratchpad_open = false;
     to.workspaces[ws].focus = Some(c);
-    to.note_focus(c);
     true
 }
 
@@ -2963,7 +2992,8 @@ mod tests {
         assert!(transfer_client(&mut from, &mut to, 3, (1000.0, 0.0), RIGHT, 0.0));
         // The source keeps a focused survivor and drops the fullscreen.
         assert_eq!(from.clients_on(0), vec![1, 2]);
-        assert!(matches!(from.focused_client(), Some(1) | Some(2)));
+        // No focus history: the first survivor in tree order.
+        assert_eq!(from.focused_client(), Some(1));
         assert_eq!(from.workspaces[0].fullscreen, None);
         assert_eq!(from.workspaces[0].fullscreen_mode, FullscreenMode::None);
         assert_eq!(from.workspace_of(3), None);
@@ -3072,12 +3102,14 @@ mod tests {
     fn detach_reports_the_workspace_and_any_float_rect() {
         let mut l = abc();
         l.toggle_float(3, AREA, 0.0);
-        assert_eq!(l.detach(2), Some((0, None)));
-        assert_eq!(
-            l.detach(3),
-            Some((0, Some(LRect::new(200.0, 120.0, 600.0, 360.0))))
-        );
-        assert_eq!(l.detach(3), None);
+        let two = l.detach(2).unwrap();
+        assert_eq!((two.client, two.ws, two.float), (2, 0, None));
+        let three = l.detach(3).unwrap();
+        assert_eq!(three.ws, 0);
+        assert_eq!(three.float, Some(LRect::new(200.0, 120.0, 600.0, 360.0)));
+        assert!(three.desk.is_some());
+        assert!(!three.client_fullscreen && !three.no_key_focus);
+        assert!(l.detach(3).is_none());
         assert_eq!(l.all_clients(), vec![1]);
         assert_eq!(l.focused_client(), Some(1));
     }
@@ -3085,11 +3117,19 @@ mod tests {
     #[test]
     fn adopt_tiles_or_floats_on_the_given_workspace() {
         let mut l = abc();
-        l.adopt(4, 7, None, AREA, 0.0);
+        let fresh = |client, float| Detached {
+            client,
+            ws: 0,
+            float,
+            desk: None,
+            client_fullscreen: false,
+            no_key_focus: false,
+        };
+        l.adopt(4, fresh(7, None), (0.0, 0.0), AREA, 0.0);
         assert_eq!(l.clients_on(4), vec![7]);
         assert!(!l.floats().iter().any(|f| f.client == 7));
         let r = LRect::new(10.0, 20.0, 300.0, 200.0);
-        l.adopt(4, 8, Some(r), AREA, 0.0);
+        l.adopt(4, fresh(8, Some(r)), (0.0, 0.0), AREA, 0.0);
         assert_eq!(l.clients_on(4), vec![7, 8]);
         assert_eq!(l.float_rect(8), Some(r));
         assert_eq!(l.workspaces[4].focus, Some(8));
@@ -3107,7 +3147,11 @@ mod tests {
         l.note_focus(3);
         l.note_focus(1);
         l.note_focus(9);
-        let taken = l.take_workspace_clients(0);
+        let taken: Vec<_> = l
+            .take_workspace_clients(0)
+            .into_iter()
+            .map(|d| (d.client, d.float))
+            .collect();
         // Never-focused clients first, then oldest to most recent focus.
         assert_eq!(taken, vec![(2, None), (3, Some(float)), (1, None)]);
         assert!(l.clients_on(0).is_empty());
@@ -3139,5 +3183,152 @@ mod tests {
         assert_eq!(l.float_rect(2), Some(moved(float3)));
         // Tiles are laid out from the area, so they do not move.
         assert_eq!(rect_of(&l, 1), AREA);
+    }
+
+    // Fix round 1 (task-2 review I1, I2, I3, client_fullscreen, M7).
+
+    #[test]
+    fn a_transfer_closes_the_targets_open_scratchpad_so_focus_goes_with_it() {
+        let mut from = abc();
+        let mut to = right_layout();
+        to.insert(12, RIGHT, 0.0);
+        to.move_focused_to_scratchpad(RIGHT, 0.0);
+        to.toggle_scratchpad();
+        assert_eq!(to.focused_client(), Some(12));
+        assert!(transfer_client(&mut from, &mut to, 3, (1000.0, 0.0), RIGHT, 0.0));
+        assert!(!to.scratchpad_open);
+        assert_eq!(to.focused_client(), Some(3));
+        // The scratchpad keeps its window for the next toggle.
+        assert_eq!(to.clients_on(SCRATCHPAD), vec![12]);
+    }
+
+    #[test]
+    fn a_tile_arriving_on_a_fullscreen_workspace_is_drawn() {
+        for mode in [FullscreenMode::Fullscreen, FullscreenMode::Maximized] {
+            let mut from = abc();
+            let mut to = right_layout();
+            to.toggle_fullscreen_mode(mode);
+            assert_eq!(to.workspaces[2].fullscreen, Some(11));
+            transfer_client(&mut from, &mut to, 3, (1000.0, 0.0), RIGHT, 0.0);
+            assert_eq!(to.workspaces[2].fullscreen, None);
+            assert_eq!(to.workspaces[2].fullscreen_mode, FullscreenMode::None);
+            assert_eq!(to.focused_client(), Some(3));
+            let drawn: Vec<_> = to.rects(RIGHT, 0.0).into_iter().map(|(c, _)| c).collect();
+            assert_eq!(drawn, vec![11, 3]);
+        }
+        // Migration's `adopt` onto a workspace that is not showing follows
+        // the same rule.
+        let mut from = abc();
+        let mut to = right_layout();
+        to.switch_workspace(0);
+        to.toggle_fullscreen_mode(FullscreenMode::Maximized);
+        to.switch_workspace(2);
+        let d = from.detach(3).unwrap();
+        to.adopt(0, d, (1000.0, 0.0), RIGHT, 0.0);
+        assert_eq!(to.workspaces[0].fullscreen, None);
+        assert_eq!(to.clients_on(0), vec![10, 3]);
+    }
+
+    #[test]
+    fn a_float_arriving_on_a_fullscreen_workspace_leaves_it_fullscreen() {
+        // Floats draw above the fullscreen window, so nothing is hidden.
+        let mut from = abc();
+        from.toggle_float(3, AREA, 0.0);
+        let mut to = right_layout();
+        to.toggle_fullscreen_mode(FullscreenMode::Maximized);
+        transfer_client(&mut from, &mut to, 3, (1000.0, 0.0), RIGHT, 0.0);
+        assert_eq!(to.workspaces[2].fullscreen, Some(11));
+        let drawn: Vec<_> = to.rects(RIGHT, 0.0).into_iter().map(|(c, _)| c).collect();
+        assert_eq!(drawn, vec![11, 3]);
+    }
+
+    #[test]
+    fn migrating_a_workspace_keeps_desktop_style_window_state() {
+        let mut from = abc();
+        from.desktop.enabled = true;
+        from.desktop.get_mut(2).unwrap().maximized = true;
+        from.desktop.get_mut(3).unwrap().minimized = true;
+        let mut to = right_layout();
+        to.desktop.enabled = true;
+        for d in from.take_workspace_clients(0) {
+            to.adopt(2, d, (1000.0, 0.0), RIGHT, 0.0);
+        }
+        assert!(from.desktop.windows.is_empty());
+        // Shifted by the offset and fitted inside RIGHT, not re-cascaded.
+        let one = to.desktop.get(1).unwrap();
+        assert_eq!(one.rect, LRect::new(1042.0, 32.0, 720.0, 456.0));
+        assert!(to.desktop.get(2).unwrap().maximized);
+        let three = to.desktop.get(3).unwrap();
+        assert!(three.minimized);
+        assert_eq!(three.rect, LRect::new(1080.0, 44.0, 720.0, 456.0));
+        // And it is what gets drawn: 3 stays minimized, 2 maximized.
+        let r = to.rects(RIGHT, 0.0);
+        assert!(r.contains(&(1, LRect::new(1042.0, 32.0, 720.0, 456.0))));
+        assert!(r.contains(&(2, RIGHT)));
+        assert!(!r.iter().any(|(c, _)| *c == 3));
+    }
+
+    #[test]
+    fn an_adopted_float_in_desktop_mode_is_drawn_at_its_carried_rect() {
+        let mut from = abc();
+        from.toggle_float(3, AREA, 0.0);
+        from.desktop.enabled = true;
+        from.desktop.get_mut(3).unwrap().rect = LRect::new(100.0, 100.0, 300.0, 200.0);
+        let mut to = right_layout();
+        to.desktop.enabled = true;
+        transfer_client(&mut from, &mut to, 3, (1000.0, 0.0), RIGHT, 0.0);
+        let r = to.rects(RIGHT, 0.0);
+        assert!(r.contains(&(3, LRect::new(1100.0, 100.0, 300.0, 200.0))));
+    }
+
+    #[test]
+    fn the_app_facing_fullscreen_flag_moves_with_the_client() {
+        let mut from = abc();
+        assert!(from.toggle_client_fullscreen(3));
+        let mut to = right_layout();
+        transfer_client(&mut from, &mut to, 3, (1000.0, 0.0), RIGHT, 0.0);
+        // The app was told it is fullscreen; the target layout knows, so
+        // the next SUPER+CTRL+F tells it `false` in one press.
+        assert!(!from.is_client_fullscreen(3));
+        assert!(to.is_client_fullscreen(3));
+        assert!(!to.toggle_client_fullscreen(3));
+        // A client that was not flagged arrives unflagged.
+        let mut from = abc();
+        let mut to = right_layout();
+        transfer_client(&mut from, &mut to, 2, (1000.0, 0.0), RIGHT, 0.0);
+        assert!(!to.is_client_fullscreen(2));
+        // The bulk path carries it too.
+        let mut from = abc();
+        from.toggle_client_fullscreen(1);
+        let mut to = right_layout();
+        for d in from.take_workspace_clients(0) {
+            to.adopt(0, d, (1000.0, 0.0), RIGHT, 0.0);
+        }
+        assert!(to.is_client_fullscreen(1));
+        assert!(!to.is_client_fullscreen(2));
+    }
+
+    #[test]
+    fn a_migrated_quick_look_panel_never_takes_focus() {
+        let mut from = abc();
+        from.add_preview_float(5, LRect::new(100.0, 100.0, 200.0, 200.0), 0);
+        let mut to = right_layout();
+        for d in from.take_workspace_clients(0) {
+            to.adopt(2, d, (1000.0, 0.0), RIGHT, 0.0);
+        }
+        assert!(!to.takes_key_focus(5));
+        assert_ne!(to.workspaces[2].focus, Some(5));
+        assert_eq!(to.float_rect(5), Some(LRect::new(1100.0, 100.0, 200.0, 200.0)));
+        assert!(to.desktop.get(5).is_none());
+    }
+
+    #[test]
+    fn taking_the_scratchpad_closes_it() {
+        let mut l = abc();
+        l.move_focused_to_scratchpad(AREA, 0.0);
+        l.toggle_scratchpad();
+        assert!(l.scratchpad_open);
+        assert_eq!(l.take_workspace_clients(SCRATCHPAD).len(), 1);
+        assert!(!l.scratchpad_open);
     }
 }

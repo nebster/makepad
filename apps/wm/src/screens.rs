@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 
-use crate::layout::{fit_inside, transfer_client, ClientId, LRect, WmLayout, SCRATCHPAD};
+use crate::layout::{transfer_client, ClientId, Detached, LRect, WmLayout, SCRATCHPAD};
 
 /// How long (seconds) a screen name must stay missing before its windows
 /// migrate (map §6.3 rule 5): mode changes and `active=false` flaps must
@@ -178,26 +178,12 @@ fn two_mut<T>(v: &mut [T], a: usize, b: usize) -> (&mut T, &mut T) {
     }
 }
 
-/// Put `c` (detached from `src`, with its float rect and desktop-style
-/// window) on `dst`'s workspace `ws`, shifting and fitting its rects.
-fn place(
-    src_rect: LRect,
-    dst: &mut ScreenLayout,
-    ws: usize,
-    c: ClientId,
-    float: Option<LRect>,
-    desk: Option<crate::desktop_layout::DesktopWindow>,
-    area: LRect,
-    gap: f64,
-) {
+/// Put a client detached from screen `src_rect` on `dst`'s workspace `ws`;
+/// `adopt` shifts its float and desktop-style rects by the screen offset and
+/// fits them inside `area`.
+fn place(src_rect: LRect, dst: &mut ScreenLayout, ws: usize, d: Detached, area: LRect, gap: f64) {
     let off = carry_offset(src_rect, dst.rect);
-    let carry = |r: LRect| fit_inside(LRect::new(r.x + off.0, r.y + off.1, r.w, r.h), area);
-    dst.layout.adopt(ws, c, float.map(carry), area, gap);
-    if let Some(mut w) = desk {
-        w.rect = carry(w.rect);
-        dst.layout.desktop.windows.retain(|x| x.client != c);
-        dst.layout.desktop.windows.push(w);
-    }
+    dst.layout.adopt(ws, d, off, area, gap);
 }
 
 impl ScreenSet {
@@ -274,20 +260,14 @@ impl ScreenSet {
         let (s, d) = two_mut(&mut self.screens, src, dst);
         let area = screen_area(d.rect, reserved_bottom, gaps_out);
         for ws in 0..=SCRATCHPAD {
-            let desks: Vec<_> = s
-                .layout
-                .clients_on(ws)
-                .into_iter()
-                .filter_map(|c| s.layout.desktop.get(c).cloned())
-                .collect();
             let taken = s.layout.take_workspace_clients(ws);
             if taken.is_empty() {
                 continue;
             }
             let prior = d.layout.workspaces[ws].focus;
-            for (c, float) in taken {
-                let desk = desks.iter().find(|w| w.client == c).cloned();
-                place(s.rect, d, ws, c, float, desk, area, gap);
+            for t in taken {
+                let c = t.client;
+                place(s.rect, d, ws, t, area, gap);
                 if !src_name.is_empty() {
                     self.homes.entry(c).or_insert_with(|| src_name.clone());
                 }
@@ -312,10 +292,9 @@ impl ScreenSet {
                 continue;
             }
             let (s, d) = two_mut(&mut self.screens, src, dst);
-            let desk = s.layout.desktop.get(c).cloned();
-            let Some((ws, float)) = s.layout.detach(c) else { continue };
+            let Some(t) = s.layout.detach(c) else { continue };
             let area = screen_area(d.rect, reserved_bottom, gaps_out);
-            place(s.rect, d, ws, c, float, desk, area, gap);
+            place(s.rect, d, t.ws, t, area, gap);
         }
     }
 
