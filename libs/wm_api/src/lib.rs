@@ -9,9 +9,10 @@
 //!
 //! Standalone (not hosted) the requests fall back: a preview/open spawns
 //! the associated app as its own window, title/cwd are no-ops.
-//! [`screens`]/[`set_fullscreen_span`] fall back too -- on the Linux
-//! direct backend (no WM, one window already covering the whole wide
-//! desktop) a span is resolved and recorded in-process; see
+//! [`screens`]/[`set_fullscreen_span`] fall back too -- on Linux (direct
+//! or windowed; only the direct backend actually ever reports screens,
+//! so a span only ever resolves there) a span is resolved against
+//! [`screens`] and recorded in-process, no WM involved; see
 //! [`span_rect_for_window`] for the rect an app lays its content into.
 //!
 //! ```ignore
@@ -188,10 +189,11 @@ pub fn screens(cx: &Cx) -> Vec<WmScreen> {
 /// The names of the screens this window currently spans fullscreen, left
 /// to right, or `None` when it spans none. Hosted: the last
 /// [`WmEvent::Screens`]'s `span`. Standalone: the span last recorded by
-/// [`set_fullscreen_span`] on the Linux direct backend, re-resolved
-/// against the live screens (dropped, like the WM drops it, if a name no
-/// longer resolves -- e.g. after a hotplug); `None` on every other
-/// standalone backend, matching that function's fallback there.
+/// [`set_fullscreen_span`] (on Linux; the cfg gate it shares with
+/// `screens`/`platform::screens()` below), re-resolved against the live
+/// screens (dropped, like the WM drops it, if a name no longer resolves
+/// -- e.g. after a hotplug); `None` on every other standalone backend,
+/// matching that function's fallback there.
 pub fn current_span(cx: &Cx) -> Option<Vec<String>> {
     if hosted(cx) {
         return LAST_SCREENS
@@ -244,16 +246,19 @@ pub fn standalone_screens(
 /// leave fullscreen); the outcome arrives as a [`WmEvent::Screens`] and is
 /// read back with [`current_span`].
 ///
-/// Standalone on the Linux direct backend (its one window already covers
-/// the whole wide desktop, so there is no WM to answer): resolves `span`
-/// against the live screens and records it directly, same-process --
-/// [`span_rect_for_window`] then gives the union rect to lay content
-/// into; no composition change. Returns false (and the recorded span is
-/// cleared) when `span` does not resolve (unknown name, not adjacent, or
-/// -- `Current` with no primary/first screen -- no live screens).
+/// Standalone on Linux (direct or windowed; same cfg gate as `screens`/
+/// `platform::screens()` -- there is no WM to answer, and on the direct
+/// backend its one window already covers the whole wide desktop):
+/// resolves `span` against the live screens and records it directly,
+/// same-process -- [`span_rect_for_window`] then gives the union rect to
+/// lay content into; no composition change. Returns false (and the
+/// recorded span is cleared) when `span` does not resolve (unknown name,
+/// not adjacent, or -- `Current` with no primary/first screen -- no live
+/// screens; windowed Linux never has any, so it always lands here).
 ///
-/// Standalone on every other backend: not yet implemented; returns false
-/// (nothing recorded, nothing asked) regardless of `span`.
+/// Standalone on every other backend (macOS, Windows, wasm,
+/// android/ohos): not yet implemented; returns false (nothing recorded,
+/// nothing asked) regardless of `span`.
 pub fn set_fullscreen_span(cx: &Cx, span: Option<ScreenSpan>) -> bool {
     if hosted(cx) {
         return send(cx, &WmRequest::SetFullscreenSpan { span });

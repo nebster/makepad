@@ -27,9 +27,10 @@ script_mod! {
         width: Fill
         height: Fill
         draw_bg +: { color: #x14181d }
-        draw_rect +: { color: #x2563eb77 }
-        draw_rect_span +: { color: #x16a34a99 }
-        draw_text +: { color: #xe2e8f0 text_style.font_size: 12.0 }
+        draw_border +: { color: #xe2e8f0 }
+        draw_rect +: { color: #x2563ebcc }
+        draw_rect_span +: { color: #x16a34acc }
+        draw_text +: { color: #xffffff text_style.font_size: 14.0 }
     }
 
     startup() do #(App::script_component(vm)){
@@ -51,16 +52,19 @@ script_mod! {
                             draw_text.color: #xe2e8f0
                         }
                     }
-                    screen_span := ScreenSpanView{}
+                    screen_span := mod.widgets.ScreenSpanView{}
                 }
             }
         }
     }
 }
 
-/// A screen's filled rect + border, in two flavours (spanned / not): a
-/// plain `DrawColor` carries a solid border via `border_size`/
-/// `border_color`, same shader as `RoundedView`'s background.
+/// A screen's filled rect, in two flavours (spanned / not), with a
+/// visible border: plain `DrawColor` has no border fields of its own
+/// (`DrawQuad`/`DrawColor` carry none; that needs `RoundedView`'s own
+/// shader), so the border is a second, larger quad drawn first
+/// (`draw_border`) with the state-colored fill (`draw_rect` /
+/// `draw_rect_span`) drawn over it, inset by `BORDER`.
 #[derive(Script, ScriptHook, Widget)]
 pub struct ScreenSpanView {
     #[uid]
@@ -75,12 +79,18 @@ pub struct ScreenSpanView {
     #[live]
     draw_bg: DrawColor,
     #[live]
+    draw_border: DrawColor,
+    #[live]
     draw_rect: DrawColor,
     #[live]
     draw_rect_span: DrawColor,
     #[live]
     draw_text: DrawText,
 }
+
+/// The border's thickness: the fill quad is inset by this on every side
+/// of the border quad drawn under it.
+const BORDER: f64 = 3.0;
 
 impl Widget for ScreenSpanView {
     fn handle_event(&mut self, _cx: &mut Cx, _event: &Event, _scope: &mut Scope) {}
@@ -108,10 +118,18 @@ impl Widget for ScreenSpanView {
                 pos: dvec2(pane.pos.x + screen.x, pane.pos.y + screen.y),
                 size: dvec2(screen.w.max(1.0), screen.h.max(1.0)),
             };
+            self.draw_border.draw_abs(cx, rect);
+            let fill = Rect {
+                pos: dvec2(rect.pos.x + BORDER, rect.pos.y + BORDER),
+                size: dvec2(
+                    (rect.size.x - BORDER * 2.0).max(1.0),
+                    (rect.size.y - BORDER * 2.0).max(1.0),
+                ),
+            };
             if in_span {
-                self.draw_rect_span.draw_abs(cx, rect);
+                self.draw_rect_span.draw_abs(cx, fill);
             } else {
-                self.draw_rect.draw_abs(cx, rect);
+                self.draw_rect.draw_abs(cx, fill);
             }
             let label = format!(
                 "{}  {}x{}{}",
