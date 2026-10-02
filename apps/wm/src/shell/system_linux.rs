@@ -1574,17 +1574,21 @@ fn read_gpu_choice() -> Option<String> {
     validate_gpu_choice(&text).ok().map(str::to_string)
 }
 
-/// The saved display layout. `display-layout` when it can be read (a
-/// malformed line in it is skipped, never fatal); otherwise the legacy
+/// The saved display layout. `display-layout` whenever it exists (a
+/// malformed line in it is skipped, never fatal; an unreadable one reads
+/// as empty, since the file's presence decides); otherwise the legacy
 /// `display-source` and `display-gpu` migrated in memory, with `gpus`
 /// (this boot's sysfs cards) mapping the source's `cardN` to its PCI
 /// address. Nothing is written here: the next save writes
 /// `display-layout`.
 fn read_display_layout(gpus: &[GpuInfo]) -> DisplayLayout {
-    let text = display_settings_path(DISPLAY_LAYOUT_FILE).ok().and_then(|path| {
+    let text = display_settings_path(DISPLAY_LAYOUT_FILE).ok().filter(|path| path.exists()).map(|path| {
         let mut text = String::new();
-        File::open(path).ok()?.take(DISPLAY_LAYOUT_MAX_LEN).read_to_string(&mut text).ok()?;
-        Some(text)
+        let read = File::open(path).and_then(|file| file.take(DISPLAY_LAYOUT_MAX_LEN).read_to_string(&mut text));
+        if read.is_err() {
+            text.clear();
+        }
+        text
     });
     if let Some(text) = text {
         return DisplayLayout::parse(&text);
