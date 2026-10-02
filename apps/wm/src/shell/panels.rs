@@ -560,6 +560,21 @@ impl ShellPanel {
         self.redraw(cx);
     }
 
+    /// The open flyout follows its module to another bar segment (the
+    /// same module pressed on another screen): a new anchor, still open,
+    /// nothing re-read.
+    pub fn move_to(&mut self, cx: &mut Cx, anchor: Rect) {
+        if self.open.is_none() {
+            return;
+        }
+        self.anchor = anchor;
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+        {
+            self.anchor_screen = self.screen;
+        }
+        self.redraw(cx);
+    }
+
     pub fn close(&mut self, cx: &mut Cx) {
         let was_open = self.open;
         self.open = None;
