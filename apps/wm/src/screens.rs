@@ -13,7 +13,9 @@
 
 use std::collections::HashMap;
 
-use crate::layout::{transfer_client, ClientId, Detached, LRect, WmLayout, SCRATCHPAD};
+use makepad_wm_api::{screens_in_window, WmEvent, WmScreen};
+
+use crate::layout::{transfer_client, ClientId, Detached, FullscreenMode, LRect, WmLayout, SCRATCHPAD};
 
 /// How long (seconds) a screen name must stay missing before its windows
 /// migrate (map §6.3 rule 5): mode changes and `active=false` flaps must
@@ -331,6 +333,38 @@ impl ScreenSet {
     pub fn area(&self, i: usize, reserved_bottom: f64, gaps_out: f64) -> LRect {
         let a = screen_area(self.screens[i].rect, self.reserved_for(i, reserved_bottom), gaps_out);
         LRect::new(a.x, a.y, a.w.max(1.0), a.h.max(1.0))
+    }
+
+    /// The live screens as the app protocol reports them, left to right,
+    /// in desk coordinates: the single unnamed fallback entry (and any
+    /// other blank name) is called `screen<i>`, as a standalone app's
+    /// unnamed screens are.
+    pub fn live_wm_screens(&self) -> Vec<WmScreen> {
+        self.screens[..self.live_count()]
+            .iter()
+            .enumerate()
+            .map(|(i, s)| WmScreen {
+                name: if s.name.is_empty() { format!("screen{i}") } else { s.name.clone() },
+                x: s.rect.x,
+                y: s.rect.y,
+                w: s.rect.w,
+                h: s.rect.h,
+                primary: i == self.main,
+            })
+            .collect()
+    }
+
+    /// The screens `c` currently covers fullscreen, by protocol name: its
+    /// own live screen while it holds a true `Fullscreen` on its
+    /// workspace (a `Maximized` one keeps the bar, so spans nothing).
+    pub fn fullscreen_span_of(&self, c: ClientId) -> Option<Vec<String>> {
+        let i = self.screen_of(c).filter(|&i| i < self.live_count())?;
+        let layout = &self.screens[i].layout;
+        let ws = &layout.workspaces[layout.workspace_of(c)?];
+        if ws.fullscreen != Some(c) || ws.fullscreen_mode != FullscreenMode::Fullscreen {
+            return None;
+        }
+        self.live_wm_screens().get(i).map(|s| vec![s.name.clone()])
     }
 
     /// Indices of the screens that are really there (not waiting out the
@@ -671,6 +705,16 @@ impl ScreenSet {
     }
 }
 
+/// The `WmEvent::Screens` a client whose window (its child's framebuffer)
+/// sits at `tile` in desk coordinates should hold: every live screen
+/// shifted into the window's own coordinates, plus what it spans.
+pub fn screens_event_for(tile: LRect, live: &[WmScreen], span: Option<Vec<String>>) -> WmEvent {
+    WmEvent::Screens {
+        screens: screens_in_window(live, tile.x, tile.y),
+        span,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -931,6 +975,78 @@ mod tests {
         b.add_float(13, LRect::new(2000.0, 100.0, 400.0, 300.0), 0);
         b.insert_on(SCRATCHPAD, 14, ba, GAP);
         set
+    }
+
+    // --- protocol: WmEvent::Screens ---------------------------------------
+
+    fn ws(name: &str, r: LRect, primary: bool) -> WmScreen {
+        WmScreen { name: n(name), x: r.x, y: r.y, w: r.w, h: r.h, primary }
+    }
+
+    #[test]
+    fn screens_event_is_window_local() {
+        let live = vec![ws("A", RA, true), ws("B", RB_, false)];
+        // A tile on B, 10pt in from its corner, 26pt down for the bar.
+        let tile = LRect::new(1930.0, 36.0, 800.0, 600.0);
+        let ev = screens_event_for(tile, &live, None);
+        assert_eq!(
+            ev,
+            WmEvent::Screens {
+                screens: vec![
+                    WmScreen { name: n("A"), x: -1930.0, y: -36.0, w: 1920.0, h: 1080.0, primary: true },
+                    WmScreen { name: n("B"), x: -10.0, y: -36.0, w: 1920.0, h: 1080.0, primary: false },
+                ],
+                span: None,
+            }
+        );
+        // Only the window's origin matters: a resize in place is the same event.
+        let grown = LRect::new(1930.0, 36.0, 1800.0, 1000.0);
+        assert_eq!(screens_event_for(grown, &live, None), ev);
+        // Moving changes it (what the WM's debounce compares).
+        assert_ne!(screens_event_for(LRect::new(0.0, 36.0, 800.0, 600.0), &live, None), ev);
+        // The span rides along untouched.
+        let spanned = screens_event_for(tile, &live, Some(vec![n("B")]));
+        assert!(matches!(spanned, WmEvent::Screens { span: Some(ref s), .. } if s == &vec![n("B")]));
+        // It survives the wire.
+        assert_eq!(WmEvent::parse(&ev.to_json()), Some(ev));
+    }
+
+    #[test]
+    fn live_wm_screens_names_fallback_and_marks_main() {
+        let set = fallback_set();
+        assert_eq!(set.live_wm_screens(), vec![ws("screen0", DESK, true)]);
+        let set = two_screens();
+        assert_eq!(set.live_wm_screens(), vec![ws("A", RA, true), ws("B", RB_, false)]);
+        let mut set = ScreenSet::new(WmLayout::new(), DESK);
+        set.reconcile(&ab(), Some("B"), 0.0, GAP, RB, GO);
+        assert_eq!(set.live_wm_screens(), vec![ws("A", RA, false), ws("B", RB_, true)]);
+        // A screen waiting out the removal debounce is not reported.
+        set.reconcile(&[(n("A"), RA)], Some("A"), 1.0, GAP, RB, GO);
+        assert_eq!(set.live_wm_screens(), vec![ws("A", RA, true)]);
+    }
+
+    #[test]
+    fn fullscreen_span_is_the_true_fullscreen_clients_screen() {
+        fn fullscreen(set: &mut ScreenSet, i: usize, c: ClientId, mode: FullscreenMode) {
+            let l = &mut set.screens[i].layout;
+            let w = l.workspace_of(c).unwrap();
+            l.workspaces[w].fullscreen = Some(c);
+            l.workspaces[w].fullscreen_mode = mode;
+        }
+        let mut set = two_screens();
+        assert_eq!(set.fullscreen_span_of(10), None);
+        fullscreen(&mut set, 1, 10, FullscreenMode::Fullscreen);
+        assert_eq!(set.fullscreen_span_of(10), Some(vec![n("B")]));
+        assert_eq!(set.fullscreen_span_of(11), None);
+        assert_eq!(set.fullscreen_span_of(1), None);
+        assert_eq!(set.fullscreen_span_of(99), None);
+        // Maximized keeps the bar: no span.
+        fullscreen(&mut set, 1, 10, FullscreenMode::Maximized);
+        assert_eq!(set.fullscreen_span_of(10), None);
+        // The single unnamed desk reports its synthesized name.
+        let mut set = fallback_set();
+        fullscreen(&mut set, 0, 1, FullscreenMode::Fullscreen);
+        assert_eq!(set.fullscreen_span_of(1), Some(vec![n("screen0")]));
     }
 
     #[test]

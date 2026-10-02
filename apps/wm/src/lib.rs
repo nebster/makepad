@@ -83,7 +83,7 @@ use makepad_widgets::makepad_platform::shared_framebuf::shared_swapchain_from_ho
 use hub::{send_to_app, ClientId, HubEvent, WmHub};
 use layout::{Axis, Dir, DividerHit, FullscreenMode, LRect};
 use makepad_studio_protocol::{AppToStudio, StudioToApp};
-use makepad_wm_api::{WmEvent, WmRequest};
+use makepad_wm_api::{ScreenSpan, WmEvent, WmRequest};
 use preview::PreviewCache;
 use run_view::MpRunView;
 use makepad_widgets::makepad_micro_serde::*;
@@ -1094,6 +1094,8 @@ impl App {
         // Wake it: samplers, refresh timers, everything a dormant instance
         // was told to hold back (`makepad_wm_api::warm_start`).
         self.send_wm_event(client, WmEvent::Adopted);
+        // …and where the screens are, once its tile is laid out.
+        self.resend_screens_event(client);
         // The tile owns the framebuffer now; the warm one is held briefly
         // in case a frame is still in flight against it.
         if let Some(frame) = self.warm_frames.get_mut(&client) {
@@ -1469,6 +1471,62 @@ impl App {
                     self.do_action(cx, WmAction::Fullscreen(FullscreenMode::Fullscreen));
                 }
             }
+            // `Current` / `None` are `SetFullscreen`. Spanning other or
+            // several screens is not supported yet: the app is told its
+            // unchanged state, so it does not wait for a span it never got.
+            WmRequest::SetFullscreenSpan { span } => match span {
+                None | Some(ScreenSpan::Current) => {
+                    let fullscreen = span.is_some();
+                    self.on_wm_request(cx, client, WmRequest::SetFullscreen { fullscreen });
+                }
+                Some(other) => {
+                    log!("wm: client {} asked to span {:?}: not supported yet", client, other);
+                    self.resend_screens_event(client);
+                }
+            },
+        }
+    }
+
+    /// Bring every tiled client's `WmEvent::Screens` up to date after a
+    /// desk draw: the live screens in that client's window coordinates and
+    /// what it spans, sent only to clients whose event changed.
+    fn sync_screens_events(&mut self) {
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        if !state.screens_dirty {
+            return;
+        }
+        state.screens_dirty = false;
+        let clients = &state.clients;
+        state.tile_origins.retain(|c, _| clients.contains_key(c));
+        state.screens_sent.retain(|c, _| clients.contains_key(c));
+        let live = state.screens.live_wm_screens();
+        let mut out = Vec::new();
+        for (client, tile) in &state.tile_origins {
+            let Some(slot) = state.clients.get(client) else { continue };
+            if slot.warm || slot.sender.is_none() {
+                continue;
+            }
+            let span = state.screens.fullscreen_span_of(*client);
+            let ev = crate::screens::screens_event_for(*tile, &live, span);
+            if state.screens_sent.get(client) != Some(&ev) {
+                out.push((*client, ev));
+            }
+        }
+        for (client, ev) in out {
+            if self.send_wm_event(client, ev.clone()) {
+                self.state_mut().screens_sent.insert(client, ev);
+            }
+        }
+    }
+
+    /// Forget what `client` was last sent and send its `WmEvent::Screens`
+    /// again on the next event (a reply, or a fresh socket after connect).
+    fn resend_screens_event(&mut self, client: ClientId) {
+        if let Some(state) = self.state.as_mut() {
+            state.screens_sent.remove(&client);
+            state.screens_dirty = true;
         }
     }
 
@@ -2872,6 +2930,8 @@ impl App {
                     if let Some(path) = self.preview_cache.take_pending(client) {
                         self.send_wm_event(client, WmEvent::PreviewFile { path });
                     }
+                    // Its screens, once its tile is laid out.
+                    self.resend_screens_event(client);
                 }
                 HubEvent::Disconnected { socket } => {
                     let client = self
@@ -5013,6 +5073,9 @@ impl MatchEvent for App {
             screen_key: Default::default(),
             screen_phys: Default::default(),
             screens_changed: false,
+            tile_origins: Default::default(),
+            screens_sent: Default::default(),
+            screens_dirty: false,
             dock_backdrop: None,
             clients: std::collections::HashMap::new(),
             hub_port,
@@ -5453,6 +5516,7 @@ impl AppMain for App {
         // A reconcile in the last desk draw: the bar follows it now.
         if self.state.is_some() && !matches!(event, Event::Draw(_)) {
             self.drain_screens_changed(cx);
+            self.sync_screens_events();
         }
         self.phone_animation_event(cx,event);
         if let Event::Storage(responses) = event {

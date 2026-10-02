@@ -374,6 +374,16 @@ pub struct WmState {
     /// App drains it on the next event to refresh the bar and cancel a
     /// drag whose screen index may have shifted.
     pub screens_changed: bool,
+    /// Where each tile's child window (its framebuffer's origin) was last
+    /// laid out, settled, in desk coordinates: what `WmEvent::Screens`
+    /// translates the screens by.
+    pub tile_origins: HashMap<ClientId, LRect>,
+    /// The `WmEvent::Screens` each client was last sent, so it is only
+    /// sent again when it changes.
+    pub screens_sent: HashMap<ClientId, makepad_wm_api::WmEvent>,
+    /// A desk draw ran (screens or tiles may have moved): App re-derives
+    /// every client's `WmEvent::Screens` on the next event.
+    pub screens_dirty: bool,
     pub clients: HashMap<ClientId, ClientSlot>,
     pub hub_port: u16,
     pub theme_name: String,
@@ -1454,6 +1464,14 @@ impl WmDesk {
         } else {
             settled_child
         };
+        if !self.minimized.contains(&client) {
+            if let Some(state) = scope.data.get_mut::<WmState>() {
+                state.tile_origins.insert(
+                    client,
+                    LRect::new(settled_child.pos.x, settled_child.pos.y, settled_child.size.x, settled_child.size.y),
+                );
+            }
+        }
         // Hyprland stretches the frozen snapshot into the shrinking box —
         // no crop (that experiment read odd; git has it).
         let _ = (closing, unscaled_rect);
@@ -1809,6 +1827,8 @@ impl Widget for WmDesk {
         }
 
         if scope.data.get_mut::<WmState>().is_some_and(|s|s.style.target.mobile()) {
+            // No desk tiles here: nothing to tell an app about its screens.
+            if let Some(state) = scope.data.get_mut::<WmState>() { state.tile_origins.clear(); }
             self.draw_phone_scene(cx,scope,rect);
             cx.end_turtle_with_area(&mut self.area);
             return DrawStep::done();
@@ -1837,6 +1857,7 @@ impl Widget for WmDesk {
             LRect::new(rect.pos.x, rect.pos.y, rect.size.x, rect.size.y),
             crate::host::now(),
         );
+        state.screens_dirty = true;
         rect.size.y = (rect.size.y - self.style.reserved_height()).max(1.0);
         let gap = state.gap;
         let gaps_out = state.gaps_out;
