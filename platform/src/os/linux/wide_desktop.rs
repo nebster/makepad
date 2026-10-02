@@ -142,8 +142,15 @@ pub fn parse_display_order(text: &str) -> Vec<String> {
 /// clamping the point into each rect and keeping the nearest result — unlike clamping a
 /// window's rectangle, there is no size to reserve, so every point on every screen is
 /// reachable. An empty `rects` leaves the point unchanged, for a backend with no published
-/// screens to clamp to.
+/// screens to clamp to. A non-finite coordinate (NaN or infinite) cannot be
+/// inside any rect or clamped toward one — every comparison against it is
+/// false, and clamping it would propagate the NaN/infinity through the
+/// nearest-point search — so it snaps to the first rect's origin instead,
+/// or is left unchanged when there are no rects to snap to.
 pub fn clamp_to_rects(rects: &[[f64; 4]], x: f64, y: f64) -> (f64, f64) {
+    if !x.is_finite() || !y.is_finite() {
+        return rects.first().map_or((x, y), |r| (r[0], r[1]));
+    }
     if rects.iter().any(|r| x >= r[0] && x <= r[0] + r[2] && y >= r[1] && y <= r[1] + r[3]) {
         return (x, y);
     }
@@ -335,5 +342,24 @@ mod tests {
     #[test]
     fn clamp_to_rects_with_no_rects_leaves_the_point_unchanged() {
         assert_eq!(clamp_to_rects(&[], 12.0, 34.0), (12.0, 34.0));
+    }
+
+    #[test]
+    fn clamp_to_rects_a_non_finite_point_snaps_to_the_first_rects_origin() {
+        // NaN or infinite input cannot be clamped into any rect (every
+        // comparison against it is false); rather than propagating NaN
+        // through the nearest-point search, it snaps to the first rect's
+        // origin, same as the "no rects" case falls back to the input.
+        let rects = [[10.0, 20.0, 100.0, 50.0], [200.0, 0.0, 50.0, 50.0]];
+        assert_eq!(clamp_to_rects(&rects, f64::NAN, 5.0), (10.0, 20.0));
+        assert_eq!(clamp_to_rects(&rects, 5.0, f64::NAN), (10.0, 20.0));
+        assert_eq!(clamp_to_rects(&rects, f64::INFINITY, f64::NEG_INFINITY), (10.0, 20.0));
+    }
+
+    #[test]
+    fn clamp_to_rects_a_non_finite_point_with_no_rects_is_returned_unchanged() {
+        let (x, y) = clamp_to_rects(&[], f64::NAN, 5.0);
+        assert!(x.is_nan());
+        assert_eq!(y, 5.0);
     }
 }

@@ -875,6 +875,10 @@ pub struct RawInput {
 
 impl RawInput {
     pub fn new(width: f64, height: f64, dpi_factor: f64) -> Self {
+        // Guard like `set_bounds` does: a non-positive or non-finite factor
+        // carries no usable information (a zeroed or corrupt state value),
+        // and dividing by it later would poison every pointer coordinate.
+        let dpi_factor = if dpi_factor.is_finite() && dpi_factor > 0.0 { dpi_factor } else { 1.0 };
         let mut input = Self {
             devices: Vec::new(),
             next_device_id: 0,
