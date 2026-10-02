@@ -3886,7 +3886,6 @@ impl CxVulkan {
             return Ok(None);
         };
         let layout = self.direct_wide_layout(direct);
-        self.direct_assign_peers(&layout);
         let extent = if layout.width > 0 && layout.height > 0 {
             vk::Extent2D { width: layout.width, height: layout.height }
         } else {
@@ -3972,6 +3971,9 @@ impl CxVulkan {
             .iter()
             .map(|output| (output.primary, output.desktop_rect))
             .collect();
+        if direct.desktop_extent == extent {
+            self.direct_assign_peers(&layout);
+        }
         for output in &mut direct.outputs {
             output.primary = false;
             output.desktop_rect = if direct.desktop_extent == extent {
@@ -4102,6 +4104,9 @@ impl CxVulkan {
                 peer_direct.scan_dirty = true;
             }
             peer.laid_out = Self::direct_peer_screens(peer_direct);
+            if peer.slice != slice {
+                peer.resend = true;
+            }
             peer.slice = slice;
         }
     }
@@ -5512,6 +5517,9 @@ impl CxVulkan {
         }
         direct.composition_generation += 1;
         direct.composition_valid = true;
+        for peer in &mut self.desktop.peers {
+            peer.resend = true;
+        }
         direct.wait = DirectWait::Ready;
         before_present();
         self.direct_service_outputs(direct)?;
