@@ -1957,6 +1957,18 @@ impl WmLayout {
         }
     }
 
+    /// Keep every float and desktop-style window reachable inside `area`
+    /// after the screen under this layout moved or shrank
+    /// (`desktop_layout::fit`: a title bar stays grabbable).
+    pub(crate) fn fit_floats(&mut self, area: LRect) {
+        for f in &mut self.floats {
+            f.rect = crate::desktop_layout::fit(f.rect, area);
+        }
+        for w in &mut self.desktop.windows {
+            w.rect = crate::desktop_layout::fit(w.rect, area);
+        }
+    }
+
     /// Take one client out of this layout entirely (the `remove` path:
     /// its tile, group tab, float, fullscreen and focus are all fixed up
     /// as for a closed window). Returns the workspace it was on and, for
@@ -2032,7 +2044,7 @@ impl WmLayout {
 /// `r` moved (not resized, unless it is larger) so it lies inside `area`.
 /// Unlike `desktop_layout::fit`, which only keeps a title bar reachable,
 /// this keeps the whole window on the target screen.
-fn fit_inside(mut r: LRect, area: LRect) -> LRect {
+pub(crate) fn fit_inside(mut r: LRect, area: LRect) -> LRect {
     r.w = r.w.min(area.w);
     r.h = r.h.min(area.h);
     r.x = r.x.clamp(area.x, area.x + area.w - r.w);
