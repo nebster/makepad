@@ -1163,7 +1163,7 @@ impl ShellPanel {
             "\nsource={:?} source_pending={:?} source_saved={:?} source_picker={} source_eligible={:?} source_scroll={} source_overflow={} source_rows={:?}",
             d.outputs.iter().find(|o| o.primary).map(|o| o.name.as_str()),
             self.display_source_pending.as_ref().map(|(name, _)| name.as_str()),
-            s.display_source, self.source_picker, eligible, self.source_scroll, self.source_overflow, self.source_targets
+            s.display_layout.main_name(d), self.source_picker, eligible, self.source_scroll, self.source_overflow, self.source_targets
         ));
         text.push_str(&format!(
             "\ngpu_now={:?} gpu_busy={} gpu_picker={} app_gpu_picker={} gpu_picker_enabled={} gpu_scroll={} gpu_overflow={} gpu_rows={:?} gpu_target_client={:?} gpu_app={:?}",

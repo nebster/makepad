@@ -9,14 +9,20 @@
 //!   the geometry and every child tile follows). The saved value is applied
 //!   once at start-up, when the window exists, unless the person is already
 //!   at the slider or has set a scale this session.
-//! * The display source ("Optimize for"): the connector whose native pixels
-//!   the shared framebuffer is rendered at goes to
-//!   `Cx::linux_set_display_source`, which validates and queues the request;
-//!   the renderer's snapshot (`primary`) is the only word on what is
-//!   actually selected, so a request stays "pending" until it is observed
-//!   there, and is reported if it never is. The saved name is asked for
-//!   once at start-up, when the inventory is up and names that output as
-//!   driven, unless the person chose first.
+//! * The display layout (`display-layout`, see `shell::display_layout`):
+//!   screen order, main screen, per-screen modes and the render-on GPU.
+//!   The WM keeps a working copy; every edit updates it and queues the
+//!   whole file for saving (one slot, newest intent). At start-up the
+//!   saved layout is restored as a safety net behind the session script's
+//!   environment (`restore_plan`): order and modes once, on the first
+//!   display generation that has a laid-out desktop; the main screen
+//!   through `Cx::linux_set_display_source` as soon as that screen is
+//!   active (or at once when it is a peer GPU's screen that has not joined
+//!   yet, which the renderer accepts early), else after a bounded wait.
+//!   Once the person changes order, main or mode this session the restore
+//!   stops, so it never undoes them. The renderer's snapshot (`primary`)
+//!   is the only word on which screen is main, so a request stays
+//!   "pending" until it is observed there, and is reported if it never is.
 //! * Pointer speed: each drag goes to `linux_input::set_pointer_speed`
 //!   (process-wide, mouse and touchpad separately). The saved values are
 //!   applied once at start-up unless the person already set that device
@@ -25,6 +31,10 @@ use crate::{shell, App, ClientId};
 use makepad_widgets::*;
 use makepad_widgets::makepad_platform::linux_input::{
     set_pointer_speed, POINTER_SPEED_MAX, POINTER_SPEED_MIN,
+};
+use makepad_widgets::makepad_platform::linux_display::LinuxDisplaySnapshot;
+use shell::display_layout::{
+    is_peer_pending, restore_plan, screen_key, DisplayLayout, RestoreOp, ScreenEntry,
 };
 use shell::panels::{PanelKind, ShellPanel};
 use shell::system_linux::{
@@ -79,11 +89,26 @@ pub struct LinuxControls {
     dpi_user_set: bool,
     /// The start-up read has been applied (or deliberately skipped) once.
     dpi_loaded_applied: bool,
-    /// The source name still to be persisted, same one-slot rule.
-    source_save: Option<String>,
-    /// The compositor GPU choice still to be persisted, same one-slot rule
-    /// (`Some(None)` clears the saved choice back to the display GPU).
-    gpu_save: Option<Option<String>>,
+    /// The working display layout: the saved one once the worker's
+    /// start-up read lands, with this session's edits on top. `None` until
+    /// either happens.
+    layout: Option<DisplayLayout>,
+    /// The worker's start-up read has been taken into `layout`.
+    layout_loaded: bool,
+    /// The whole layout still to be persisted, same one-slot rule.
+    layout_save: Option<DisplayLayout>,
+    /// The person changed order, main screen or a mode this session: the
+    /// start-up restore must not override them, and a late read keeps
+    /// their screens.
+    layout_user_set: bool,
+    /// The person chose a render-on GPU this session; a late read keeps it.
+    gpu_user_set: bool,
+    /// The saved order and modes have been restored (or deliberately
+    /// skipped) once.
+    layout_restore_done: bool,
+    /// The display generation the order/mode restore last looked at; the
+    /// plan is computed once per new generation until it applied.
+    layout_restore_generation: Option<u64>,
     /// Accepted compositor switch whose persistence waits until
     /// `finish_linux_gpu_choice`. `Some(None)` is the display GPU.
     gpu_after_commit: Option<Option<String>>,
@@ -95,9 +120,8 @@ pub struct LinuxControls {
     /// The start-up read has been applied (or deliberately skipped) once
     /// per device.
     pointer_loaded_applied: [bool; 2],
-    /// The person chose a source this session.
-    source_user_set: bool,
-    /// The saved source has been asked for (or deliberately skipped) once.
+    /// The saved main screen has been asked for (or deliberately skipped)
+    /// once.
     source_loaded_applied: bool,
     /// When the start-up restoration first saw an inventory to decide on;
     /// the bounded wait for a not-yet-presenting output counts from here.
@@ -109,6 +133,45 @@ pub struct LinuxControls {
 
 fn valid_dpi(dpi: f64) -> bool {
     dpi.is_finite() && dpi > 0.0
+}
+
+impl LinuxControls {
+    /// Edit the working layout and queue the whole file for saving. With a
+    /// snapshot, every live screen is made part of the layout first, so an
+    /// edit of one that was not saved yet is not lost.
+    fn edit_layout(&mut self, displays: Option<&LinuxDisplaySnapshot>, edit: impl FnOnce(&mut DisplayLayout)) {
+        let layout = self.layout.get_or_insert_with(DisplayLayout::default);
+        if let Some(displays) = displays {
+            layout.include_snapshot(displays);
+        }
+        edit(layout);
+        self.layout_save = Some(layout.clone());
+    }
+
+    /// The person changed order, main screen or a mode: the start-up
+    /// restore is over for this session.
+    fn layout_set_by_person(&mut self) {
+        self.layout_user_set = true;
+        self.layout_restore_done = true;
+        self.source_loaded_applied = true;
+    }
+
+    /// The worker's start-up read: the working copy unless this session
+    /// already edited it first, in which case each part the person did not
+    /// touch (screens, render-on) comes from the read.
+    fn adopt_loaded_layout(&mut self, loaded: &DisplayLayout) {
+        match self.layout.as_mut() {
+            None => self.layout = Some(loaded.clone()),
+            Some(layout) => {
+                if !self.layout_user_set {
+                    layout.screens = loaded.screens.clone();
+                }
+                if !self.gpu_user_set {
+                    layout.render_on = loaded.render_on.clone();
+                }
+            }
+        }
+    }
 }
 
 impl App {
@@ -181,7 +244,7 @@ impl App {
         let pending = self.linux_controls.gpu_after_commit.take();
         if success {
             if let Some(choice) = pending {
-                self.linux_controls.gpu_save = Some(choice);
+                self.linux_controls.edit_layout(None, |layout| layout.render_on = choice);
             }
         }
         if !self.linux_gpu.notice.is_empty() {
@@ -191,15 +254,20 @@ impl App {
     }
 
     /// Ask the renderer for a source. `Ok` means the request is queued,
-    /// not that the source changed: the flyout shows the name as pending
-    /// until the snapshot's `primary` says it is the one.
-    fn request_display_source(&mut self, cx: &mut Cx, name: &str) -> bool {
+    /// not that the source changed: with `confirm` the flyout shows the
+    /// name as pending until the snapshot's `primary` says it is the one.
+    /// A peer GPU's screen that has not joined yet becomes `primary` only
+    /// once it starts, however long that takes, so its start-up restore
+    /// goes without the bounded confirmation.
+    fn request_display_source(&mut self, cx: &mut Cx, name: &str, confirm: bool) -> bool {
         match cx.linux_set_display_source(name) {
             Ok(()) => {
-                let panel = self.ui.widget(cx, ids!(shell_panel));
-                if let Some(mut p) = panel.borrow_mut::<ShellPanel>() {
-                    p.display_source_pending = Some((name.to_string(), Cx::monotonic_now()));
-                    p.redraw(cx);
+                if confirm {
+                    let panel = self.ui.widget(cx, ids!(shell_panel));
+                    if let Some(mut p) = panel.borrow_mut::<ShellPanel>() {
+                        p.display_source_pending = Some((name.to_string(), Cx::monotonic_now()));
+                        p.redraw(cx);
+                    };
                 }
                 true
             }
@@ -270,12 +338,22 @@ impl App {
             }
             ControlAction::DisplaySource(name) => {
                 self.linux_controls.notice.clear();
-                self.linux_controls.source_user_set = true;
-                self.linux_controls.source_loaded_applied = true;
+                self.linux_controls.layout_set_by_person();
                 match validate_display_source(&name) {
-                    // Persist only what the renderer accepted to try.
-                    Ok(name) if self.request_display_source(cx, name) => {
-                        self.linux_controls.source_save = Some(name.to_string());
+                    // Persist only what the renderer accepted to try, as
+                    // the layout's main screen (keyed by PCI address and
+                    // connector, not this boot's card number).
+                    Ok(name) if self.request_display_source(cx, name, true) => {
+                        let displays = cx.linux_display_snapshot();
+                        match displays.outputs.iter().find(|o| o.name == name).and_then(screen_key) {
+                            Some(key) => self.linux_controls.edit_layout(Some(&displays), |layout| {
+                                if !layout.screens.iter().any(|entry| entry.key == key) {
+                                    layout.screens.push(ScreenEntry { key: key.clone(), main: false, mode: None });
+                                }
+                                layout.set_main(&key);
+                            }),
+                            None => log!("wm: main screen {name} not saved: its card has no PCI address"),
+                        }
                     }
                     Ok(_) => {}
                     Err(message) => self.linux_controls.notice = format!("Optimize for: {message}"),
@@ -295,10 +373,12 @@ impl App {
                         Ok(uuid) => match self.change_compositor_gpu(cx, uuid) {
                             Err(message) => self.linux_controls.notice = format!("Render on: {message}"),
                             Ok(()) => {
+                                self.linux_controls.gpu_user_set = true;
                                 if self.linux_gpu.active() {
                                     self.linux_controls.gpu_after_commit = Some(choice);
                                 } else {
-                                    self.linux_controls.gpu_save = Some(choice);
+                                    self.linux_controls
+                                        .edit_layout(None, |layout| layout.render_on = choice);
                                 }
                             }
                         },
@@ -401,18 +481,11 @@ impl App {
                         state.dpi_save = Some(value);
                     }
                 }
-                if let Some(name) = state.source_save.take() {
-                    if let Err(SystemCommand::SaveDisplaySource(name)) =
-                        controller.send(SystemCommand::SaveDisplaySource(name))
+                if let Some(layout) = state.layout_save.take() {
+                    if let Err(SystemCommand::SaveDisplayLayout(layout)) =
+                        controller.send(SystemCommand::SaveDisplayLayout(layout))
                     {
-                        state.source_save = Some(name);
-                    }
-                }
-                if let Some(choice) = state.gpu_save.take() {
-                    if let Err(SystemCommand::SaveGpuChoice(choice)) =
-                        controller.send(SystemCommand::SaveGpuChoice(choice))
-                    {
-                        state.gpu_save = Some(choice);
+                        state.layout_save = Some(layout);
                     }
                 }
                 for i in 0..2 {
@@ -435,8 +508,7 @@ impl App {
             } else {
                 state.waiting.clear();
                 let unsaved = state.dpi_save.take().is_some()
-                    | state.source_save.take().is_some()
-                    | state.gpu_save.take().is_some()
+                    | state.layout_save.take().is_some()
                     | state.pointer_save[0].take().is_some()
                     | state.pointer_save[1].take().is_some();
                 state.notice = if unsaved {
@@ -459,9 +531,8 @@ impl App {
         } else { None };
         // The saved settings, once each. A late read after the person
         // already acted is ignored; nothing saved means the launch (scale)
-        // or the renderer's own (source) default stands.
+        // or the renderer's own (layout) default stands.
         let mut initial_scale = None;
-        let mut initial_source = None;
         let mut initial_pointer = [None; 2];
         if let Some(snapshot) = snapshot.as_ref().filter(|s| s.display_settings_loaded) {
             if !state.dpi_loaded_applied {
@@ -473,16 +544,19 @@ impl App {
                     state.dpi_loaded_applied = true;
                 }
             }
-            if !state.source_loaded_applied {
-                if state.source_user_set {
-                    state.source_loaded_applied = true;
-                } else if let Some(name) = snapshot.display_source.clone() {
-                    initial_source = Some(name);
-                } else {
+            if !state.layout_loaded {
+                state.layout_loaded = true;
+                state.adopt_loaded_layout(&snapshot.display_layout);
+                if snapshot.display_layout.screens.is_empty() {
+                    // Nothing saved to arrange: the renderer's defaults stand.
+                    state.layout_restore_done = true;
                     state.source_loaded_applied = true;
                 }
             }
         }
+        let restore_pending = snapshot.as_ref().is_some_and(|s| s.display_settings_loaded)
+            && !state.layout_user_set
+            && (!state.layout_restore_done || !state.source_loaded_applied);
         if let Some(snapshot) = snapshot.as_ref().filter(|s| s.input_settings_loaded) {
             for i in 0..2 {
                 if !state.pointer_loaded_applied[i] {
@@ -524,52 +598,11 @@ impl App {
         // open Display panel, a saved source to ask for, a request to
         // confirm. Immutable cached snapshots, no lock, no Vulkan, no
         // filesystem. GPU identity is only for the open Display readout.
-        let displays = (monitor_open || initial_source.is_some() || pending.is_some())
+        let displays = (monitor_open || restore_pending || pending.is_some())
             .then(|| cx.linux_display_snapshot());
         let gpus = monitor_open.then(|| cx.linux_gpu_snapshot());
-        if let (Some(name), Some(displays)) = (initial_source.as_deref(), displays.as_ref()) {
-            let now = Cx::monotonic_now();
-            if !displays.direct {
-                // The desktop owns the outputs: nothing to ask for.
-                self.linux_controls.source_loaded_applied = true;
-                log!("wm: saved display source {name} not applied: the desktop owns the outputs");
-            } else if displays.outputs.is_empty() || adjusting {
-                // No inventory yet, or the scale slider is held: a source
-                // change moves the window as a scale change does. Wait;
-                // nothing is decided or logged until then.
-            } else {
-                // The bounded wait opens when the inventory is first seen:
-                // an output that is listed but has not presented a frame
-                // yet (`active`) gets that long to, so a settings snapshot
-                // that beats the first presentation cannot skip the choice.
-                // Handled only on apply, a deliberate fallback, or the
-                // person choosing (elsewhere); waiting logs nothing.
-                let since = *self.linux_controls.source_restore_since.get_or_insert(now);
-                let handled = match displays.outputs.iter().find(|o| o.name == name) {
-                    Some(output) if output.primary => {
-                        log!("wm: saved display source {name} is already the source");
-                        true
-                    }
-                    Some(output) if output.active => {
-                        log!("wm: applying saved display source {name}");
-                        self.request_display_source(cx, name);
-                        changed = true;
-                        true
-                    }
-                    Some(_) if now - since > SOURCE_RESTORE_TIMEOUT => {
-                        log!("wm: saved display source {name} did not become usable; keeping the renderer's default");
-                        true
-                    }
-                    Some(_) => false,
-                    None => {
-                        log!("wm: saved display source {name} is not connected; keeping the renderer's default");
-                        true
-                    }
-                };
-                if handled {
-                    self.linux_controls.source_loaded_applied = true;
-                }
-            }
+        if let (true, Some(displays)) = (restore_pending, displays.as_ref()) {
+            changed |= self.restore_display_layout(cx, displays, adjusting);
         }
         let actual_dpi = self.main_window_dpi(cx);
         let state = &mut self.linux_controls;
@@ -649,12 +682,111 @@ impl App {
         self.reanchor_shell_panel(cx);
     }
 
+    /// The start-up restore of the saved layout, against this poll's
+    /// display inventory. Returns whether it asked the renderer for
+    /// anything. Order and modes go once, on the first new display
+    /// generation whose desktop is laid out (the renderer stores both
+    /// before a peer GPU's screen joins, so it joins as saved). The main
+    /// screen is asked for once it is active, or at once when it is a peer
+    /// GPU's screen still to join; a screen of this GPU that is listed but
+    /// has not shown a frame gets `SOURCE_RESTORE_TIMEOUT` to, counted
+    /// from the first inventory seen.
+    fn restore_display_layout(&mut self, cx: &mut Cx, displays: &LinuxDisplaySnapshot, adjusting: bool) -> bool {
+        if !displays.direct {
+            // The desktop owns the outputs: nothing to arrange.
+            log!("wm: saved display layout not applied: the desktop owns the outputs");
+            self.linux_controls.layout_restore_done = true;
+            self.linux_controls.source_loaded_applied = true;
+            return false;
+        }
+        if displays.outputs.is_empty() || adjusting {
+            // No inventory yet, or the scale slider is held: a layout
+            // change moves the window as a scale change does. Wait;
+            // nothing is decided or logged until then.
+            return false;
+        }
+        let layout = self.linux_controls.layout.clone().unwrap_or_default();
+        let plan = restore_plan(&layout, displays);
+        let mut asked = false;
+        if !self.linux_controls.layout_restore_done {
+            let generation = cx.linux_display_generation();
+            let laid_out = displays.outputs.iter().any(|o| o.desktop_position.is_some());
+            if self.linux_controls.layout_restore_generation != Some(generation) && laid_out {
+                self.linux_controls.layout_restore_generation = Some(generation);
+                for op in &plan {
+                    match op {
+                        RestoreOp::Order(order) => {
+                            log!("wm: applying saved display order {}", order.join(","));
+                            if let Err(message) = cx.linux_set_display_order(order) {
+                                log!("wm: saved display order refused: {message}");
+                            }
+                            asked = true;
+                        }
+                        RestoreOp::Mode(name, mode) => {
+                            let label = mode.as_deref().unwrap_or("automatic");
+                            log!("wm: applying saved mode {label} for {name}");
+                            if let Err(message) = cx.linux_set_display_mode(name, mode.as_deref()) {
+                                log!("wm: saved mode {label} for {name} refused: {message}");
+                            }
+                            asked = true;
+                        }
+                        RestoreOp::Main(_) => {}
+                    }
+                }
+                self.linux_controls.layout_restore_done = true;
+            }
+        }
+        if !self.linux_controls.source_loaded_applied {
+            let now = Cx::monotonic_now();
+            let since = *self.linux_controls.source_restore_since.get_or_insert(now);
+            let request = plan.iter().find_map(|op| match op {
+                RestoreOp::Main(name) => Some(name.as_str()),
+                _ => None,
+            });
+            let handled = match (request, layout.main_name(displays)) {
+                (_, None) => {
+                    if layout.screens.iter().any(|entry| entry.main) {
+                        log!("wm: saved main screen is not connected; keeping the renderer's default");
+                    }
+                    true
+                }
+                (None, Some(name)) => {
+                    log!("wm: saved main screen {name} is already the main screen");
+                    true
+                }
+                (Some(name), _) => match displays.outputs.iter().find(|o| o.name == name) {
+                    Some(output) if output.active => {
+                        log!("wm: applying saved main screen {name}");
+                        self.request_display_source(cx, name, true);
+                        asked = true;
+                        true
+                    }
+                    Some(output) if is_peer_pending(output) => {
+                        log!("wm: applying saved main screen {name} (another GPU's, joining)");
+                        self.request_display_source(cx, name, false);
+                        asked = true;
+                        true
+                    }
+                    Some(_) if now - since > SOURCE_RESTORE_TIMEOUT => {
+                        log!("wm: saved main screen {name} did not become usable; keeping the renderer's default");
+                        true
+                    }
+                    Some(_) => false,
+                    None => true,
+                },
+            };
+            if handled {
+                self.linux_controls.source_loaded_applied = true;
+            }
+        }
+        asked
+    }
+
     pub(crate) fn shutdown_linux_controls(&mut self) {
         if let Some(mut controller) = self.linux_controls.controller.take() { controller.shutdown(); }
         self.linux_controls.waiting.clear();
         self.linux_controls.dpi_save = None;
-        self.linux_controls.source_save = None;
-        self.linux_controls.gpu_save = None;
+        self.linux_controls.layout_save = None;
         self.linux_controls.gpu_after_commit = None;
         self.linux_controls.pointer_save = [None; 2];
     }

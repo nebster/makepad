@@ -46,6 +46,11 @@ use super::system_linux::validate_gpu_choice;
 const HEADER_KEYWORD: &str = "makepad-display-layout";
 /// The header line's version, written on every save.
 const FORMAT_VERSION: &str = "1";
+/// The status the renderer gives a connected screen on another GPU whose
+/// peer has not joined the wide desktop yet (`OTHER_GPU_STATUS` in
+/// `vulkan_linux.rs`, private there, so mirrored). The renderer accepts
+/// such a screen as the main screen and takes its mode before it starts.
+pub const PEER_PENDING_STATUS: &str = "unsupported: driven by another GPU";
 
 /// A screen's identity across reboots and card renumbering: the card's PCI
 /// address (`LinuxDisplayOutput::pci`) and the connector name with its
@@ -57,7 +62,7 @@ pub struct ScreenKey {
 }
 
 /// One `screen` line.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScreenEntry {
     pub key: ScreenKey,
     pub main: bool,
@@ -66,7 +71,7 @@ pub struct ScreenEntry {
 
 /// The whole saved file: the render-on GPU (`None` is Auto) and the
 /// screens in left-to-right order.
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct DisplayLayout {
     pub render_on: Option<String>,
     pub screens: Vec<ScreenEntry>,
@@ -310,6 +315,107 @@ impl DisplayLayout {
     }
 }
 
+impl DisplayLayout {
+    /// Makes sure every placed screen of `snap` that has a key is one of
+    /// the saved screens, so an edit (`set_main`, `set_mode`,
+    /// `move_screen`) on a live screen is never a no-op. When one is
+    /// missing (nothing saved yet, or a layout migrated from the old
+    /// single-name `display-source`), the screens become the live
+    /// arrangement left to right as [`DisplayLayout::from_snapshot`]
+    /// builds it, followed by the saved screens that are not placed now
+    /// (not connected this boot, or a peer's screen still to join), kept
+    /// with their modes (their `main` dropped when a live screen is main).
+    /// A layout that already covers every live screen is left exactly as
+    /// saved.
+    pub fn include_snapshot(&mut self, snap: &LinuxDisplaySnapshot) {
+        let live = DisplayLayout::from_snapshot(snap, None).screens;
+        if live.iter().all(|entry| self.screens.iter().any(|saved| saved.key == entry.key)) {
+            return;
+        }
+        let mut screens = live;
+        let rest: Vec<ScreenEntry> = self
+            .screens
+            .iter()
+            .filter(|saved| !screens.iter().any(|live| live.key == saved.key))
+            .cloned()
+            .collect();
+        for mut entry in rest {
+            if screens.iter().any(|other| other.main) {
+                entry.main = false;
+            }
+            screens.push(entry);
+        }
+        self.screens = screens;
+    }
+}
+
+/// One step of bringing the running desktop in line with the saved
+/// layout: the `Cx::linux_set_display_*` call it stands for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RestoreOp {
+    /// `linux_set_display_order` with these this-boot names.
+    Order(Vec<String>),
+    /// `linux_set_display_mode(name, mode)`.
+    Mode(String, Option<String>),
+    /// `linux_set_display_source(name)`: make it the main screen.
+    Main(String),
+}
+
+/// What the running desktop still needs to match `layout`, as order, then
+/// modes, then main. Only saved screens that resolve this boot count;
+/// the rest are ignored. Idempotent: a snapshot that already shows the
+/// layout yields nothing.
+///
+/// * `Order(order_names)` when the placed screens, left to right by
+///   `desktop_position.x`, are not in the saved order, or when a saved
+///   screen is a peer that has not joined yet ([`is_peer_pending`]): the
+///   order is stored before it joins, so it joins on its saved side.
+/// * `Mode(name, Some(mode))` per resolved screen whose saved mode is not
+///   its `mode_override`. A screen saved without `mode=` leaves the
+///   running mode alone: an external `MAKEPAD_DRM_MODES` wins, and a
+///   layout migrated from `display-source` knows no modes.
+/// * `Main(name)` when the saved main screen resolves and is not
+///   `primary`.
+pub fn restore_plan(layout: &DisplayLayout, snap: &LinuxDisplaySnapshot) -> Vec<RestoreOp> {
+    let mut ops = Vec::new();
+    let resolved = layout.resolve(snap);
+    if resolved.is_empty() {
+        return ops;
+    }
+    let output_named =
+        |name: &str| snap.outputs.iter().find(|output| output.name == name);
+    let mut placed: Vec<&LinuxDisplayOutput> =
+        snap.outputs.iter().filter(|output| output.desktop_position.is_some()).collect();
+    placed.sort_by_key(|output| output.desktop_position.map(|(x, _)| x).unwrap_or(0));
+    let placed_names: Vec<&str> = placed.iter().map(|output| output.name.as_str()).collect();
+    let order = layout.order_names(snap);
+    let wanted: Vec<&str> =
+        order.iter().map(String::as_str).filter(|name| placed_names.contains(name)).collect();
+    let peer_to_join =
+        resolved.iter().any(|(_, name)| output_named(name).is_some_and(is_peer_pending));
+    if wanted != placed_names || peer_to_join {
+        ops.push(RestoreOp::Order(order.clone()));
+    }
+    for (index, name) in &resolved {
+        let Some(mode) = layout.screens[*index].mode.as_ref() else { continue };
+        if output_named(name).is_some_and(|output| output.mode_override.as_ref() != Some(mode)) {
+            ops.push(RestoreOp::Mode(name.clone(), Some(mode.clone())));
+        }
+    }
+    if let Some(main) = layout.main_name(snap) {
+        if output_named(&main).is_some_and(|output| !output.primary) {
+            ops.push(RestoreOp::Main(main));
+        }
+    }
+    ops
+}
+
+/// A connected screen on another GPU whose peer has not joined the wide
+/// desktop yet: the renderer already accepts it as the main screen.
+pub fn is_peer_pending(output: &LinuxDisplayOutput) -> bool {
+    output.status.starts_with(PEER_PENDING_STATUS)
+}
+
 /// `output`'s screen key, or `None` when it has no resolvable `pci` (it
 /// could never be matched back on a later boot, so it is not worth
 /// saving).
@@ -529,6 +635,132 @@ mod tests {
         let layout = DisplayLayout::migrate(Some("card1-HDMI-A-1"), Some("not a gpu choice"), &card_pci);
         assert_eq!(layout.screens.len(), 0);
         assert_eq!(layout.render_on, None);
+    }
+
+    fn peer_pending(name: &str, pci: &str) -> LinuxDisplayOutput {
+        LinuxDisplayOutput {
+            status: format!("{PEER_PENDING_STATUS} (card1); it joins the wide desktop as a peer"),
+            ..output(name, pci)
+        }
+    }
+
+    fn key(pci: &str, connector: &str) -> ScreenKey {
+        ScreenKey { pci: pci.to_string(), connector: connector.to_string() }
+    }
+
+    #[test]
+    fn restore_plan_reorders_a_fresh_snapshot_in_default_order() {
+        // Default order puts HDMI-A-1 left; the saved file wants it right.
+        let snap = snapshot(vec![
+            placed("card0-HDMI-A-1", "0000:00:02.0", 0, true),
+            placed("card0-HDMI-A-2", "0000:00:02.0", 1920, false),
+        ]);
+        let layout = DisplayLayout::parse(
+            "screen 0000:00:02.0 HDMI-A-2\nscreen 0000:00:02.0 HDMI-A-1 main\n",
+        );
+        assert_eq!(
+            restore_plan(&layout, &snap),
+            vec![RestoreOp::Order(vec!["card0-HDMI-A-2".to_string(), "card0-HDMI-A-1".to_string()])]
+        );
+    }
+
+    #[test]
+    fn restore_plan_sets_a_mode_that_differs() {
+        let snap = snapshot(vec![placed("card0-HDMI-A-2", "0000:00:02.0", 0, true)]);
+        let layout = DisplayLayout::parse("screen 0000:00:02.0 HDMI-A-2 main mode=3840x2160@30\n");
+        assert_eq!(
+            restore_plan(&layout, &snap),
+            vec![RestoreOp::Mode("card0-HDMI-A-2".to_string(), Some("3840x2160@30".to_string()))]
+        );
+    }
+
+    #[test]
+    fn restore_plan_leaves_a_running_mode_alone_when_none_is_saved() {
+        let mut out = placed("card0-HDMI-A-2", "0000:00:02.0", 0, true);
+        out.mode_override = Some("3840x2160@30".to_string());
+        let layout = DisplayLayout::parse("screen 0000:00:02.0 HDMI-A-2 main\n");
+        assert_eq!(restore_plan(&layout, &snapshot(vec![out])), vec![]);
+    }
+
+    #[test]
+    fn restore_plan_is_empty_once_applied() {
+        let mut left = placed("card1-HDMI-A-2", "0000:00:02.0", 0, false);
+        left.mode_override = Some("3840x2160@30".to_string());
+        let right = placed("card0-HDMI-A-1", "0000:01:00.0", 3840, true);
+        // Snapshot lists in default order (by name), not left to right.
+        let snap = snapshot(vec![right, left]);
+        let layout = DisplayLayout::parse(
+            "render-on 0000:01:00.0 10de:2b85\n\
+             screen 0000:00:02.0 HDMI-A-2 mode=3840x2160@30\n\
+             screen 0000:01:00.0 HDMI-A-1 main\n",
+        );
+        assert_eq!(restore_plan(&layout, &snap), vec![]);
+        // And the snapshot's own arrangement plans nothing either.
+        assert_eq!(restore_plan(&DisplayLayout::from_snapshot(&snap, None), &snap), vec![]);
+    }
+
+    #[test]
+    fn restore_plan_asks_for_a_main_screen_on_a_peer_not_yet_active() {
+        // The iGPU screen is up; the 5090's is listed as driven by another
+        // GPU and has not joined yet. Order is seeded so it joins on the
+        // saved side; main is asked for at once.
+        let snap = snapshot(vec![
+            placed("card1-HDMI-A-2", "0000:00:02.0", 0, true),
+            peer_pending("card0-HDMI-A-1", "0000:01:00.0"),
+        ]);
+        let layout = DisplayLayout::parse(
+            "screen 0000:00:02.0 HDMI-A-2\nscreen 0000:01:00.0 HDMI-A-1 main\n",
+        );
+        assert_eq!(
+            restore_plan(&layout, &snap),
+            vec![
+                RestoreOp::Order(vec!["card1-HDMI-A-2".to_string(), "card0-HDMI-A-1".to_string()]),
+                RestoreOp::Main("card0-HDMI-A-1".to_string()),
+            ]
+        );
+        assert!(is_peer_pending(&snap.outputs[1]));
+        assert!(!is_peer_pending(&snap.outputs[0]));
+    }
+
+    #[test]
+    fn restore_plan_ignores_unresolved_screens() {
+        // Saved screens on a card that is gone, and one whose connector
+        // exists only on the other GPU: neither is matched.
+        let snap = snapshot(vec![
+            placed("card0-HDMI-A-1", "0000:00:02.0", 0, true),
+            placed("card0-DP-1", "0000:00:02.0", 1920, false),
+        ]);
+        let layout = DisplayLayout::parse(
+            "screen 0000:ff:00.0 DP-9 main mode=1920x1080\nscreen 0000:01:00.0 HDMI-A-1 mode=1280x720\n",
+        );
+        assert_eq!(restore_plan(&layout, &snap), vec![]);
+    }
+
+    #[test]
+    fn include_snapshot_adds_live_screens_and_keeps_unresolved_ones() {
+        let snap = snapshot(vec![
+            placed("card0-HDMI-A-1", "0000:00:02.0", 1920, true),
+            placed("card0-DP-1", "0000:00:02.0", 0, false),
+        ]);
+        // Migrated: only the main screen, and it is not connected now.
+        let mut layout = DisplayLayout::parse("screen 0000:01:00.0 HDMI-A-1 main\n");
+        layout.include_snapshot(&snap);
+        let keys: Vec<&ScreenKey> = layout.screens.iter().map(|entry| &entry.key).collect();
+        assert_eq!(
+            keys,
+            vec![&key("0000:00:02.0", "DP-1"), &key("0000:00:02.0", "HDMI-A-1"), &key("0000:01:00.0", "HDMI-A-1")]
+        );
+        assert_eq!(layout.screens.iter().filter(|entry| entry.main).count(), 1);
+        assert!(layout.screens[1].main);
+        layout.set_main(&key("0000:00:02.0", "DP-1"));
+        assert!(layout.screens[0].main && !layout.screens[1].main);
+        // A layout that already covers every live screen is left alone.
+        let mut covered = DisplayLayout::parse(
+            "screen 0000:00:02.0 HDMI-A-1 mode=1280x720\nscreen 0000:00:02.0 DP-1 main\n",
+        );
+        let before = covered.clone();
+        covered.include_snapshot(&snap);
+        assert_eq!(covered, before);
     }
 
     #[test]
