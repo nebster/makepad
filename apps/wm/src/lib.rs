@@ -3777,7 +3777,8 @@ impl App {
     /// The focused window of bar segment `seg`'s screen (its title).
     fn bar_focused_client(&mut self, seg: usize) -> Option<ClientId> {
         let screen = self.bar_screen(seg);
-        self.state_mut().layout_at(screen).focused_client()
+        let spanned = self.state_mut().screens.spanned(screen);
+        spanned.or_else(|| self.state_mut().layout_at(screen).focused_client())
     }
 
     /// A click on workspace cell `i` of bar segment `seg`: that segment's
@@ -3791,6 +3792,12 @@ impl App {
             return;
         };
         let screen = self.bar_screen(seg);
+        // A screen a span covers from another screen shows that span, not
+        // its own workspaces: its cells do nothing (the home screen's
+        // cells switch the span's workspace).
+        if self.state_mut().screens.span_home(screen).is_some_and(|home| home != screen) {
+            return;
+        }
         let old = self.state_mut().screens.active;
         self.state_mut().screens.active = screen;
         self.do_action(cx, WmAction::Workspace(ws));
@@ -4350,6 +4357,11 @@ impl App {
 
     fn begin_drag(&mut self, cx: &mut Cx, abs: Vec2d, resize: bool) -> bool {
         self.sync_geometry(cx);
+        // A span's window is fullscreen: nothing to move or resize, and
+        // the screens it covers have no other window to grab.
+        if self.state_mut().span_at(abs.x, abs.y).is_some() {
+            return false;
+        }
         // The window under the pointer is on the screen under the pointer.
         let screen = self.state_mut().screen_under(abs.x, abs.y);
         let area = self.screen_area(cx, screen);
@@ -4628,6 +4640,11 @@ impl App {
     /// window behaves exactly as it always did.
     fn begin_divider_drag(&mut self, cx: &mut Cx, abs: Vec2d) -> bool {
         self.sync_geometry(cx);
+        // Over a span the press is its window's: the covered screens'
+        // hidden tiling has no dividers to grab.
+        if self.state_mut().span_at(abs.x, abs.y).is_some() {
+            return false;
+        }
         let screen = self.state_mut().screen_under(abs.x, abs.y);
         let area = self.screen_area(cx, screen);
         let gap = self.state_mut().gap;
@@ -4706,11 +4723,12 @@ impl App {
         let screen = self.state_mut().screen_under(abs.x, abs.y);
         let area = self.screen_area(cx, screen);
         let gap = self.state_mut().gap;
-        let on_client = self
-            .state_mut()
-            .layout_at(screen)
-            .client_at(abs.x, abs.y, area, gap)
-            .is_some();
+        let on_client = self.state_mut().span_at(abs.x, abs.y).is_some()
+            || self
+                .state_mut()
+                .layout_at(screen)
+                .client_at(abs.x, abs.y, area, gap)
+                .is_some();
         let axis = if on_client {
             None
         } else {
@@ -4774,7 +4792,12 @@ impl App {
     /// screen under the pointer.
     fn scroll_workspace(&mut self, cx: &mut Cx, down: bool, abs: Vec2d) {
         let state = self.state_mut();
-        state.screens.active = state.screen_under(abs.x, abs.y);
+        // Over a span: its home screen, whose workspace holds the span
+        // (switching it away hides the span, like a fullscreen).
+        state.screens.active = match state.span_at(abs.x, abs.y) {
+            Some((_, home)) => home,
+            None => state.screen_under(abs.x, abs.y),
+        };
         let layout = self.state_mut().layout();
         let n = layout.cycle_occupied(layout.active, down);
         self.state_mut().layout_mut().switch_workspace(n);

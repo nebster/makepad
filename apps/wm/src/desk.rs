@@ -465,6 +465,15 @@ impl WmState {
         &mut self.screens.screens[i].layout
     }
 
+    /// The shown span under `(x, y)`: its client and home screen (never
+    /// in a mobile style, which draws no spans).
+    pub fn span_at(&self, x: f64, y: f64) -> Option<(ClientId, usize)> {
+        if self.style.target.mobile() {
+            return None;
+        }
+        self.screens.span_at(x, y)
+    }
+
     /// The live screen under `(x, y)` (the nearest one outside them all),
     /// the active one when there is only one or in a mobile style.
     pub fn screen_under(&self, x: f64, y: f64) -> usize {
