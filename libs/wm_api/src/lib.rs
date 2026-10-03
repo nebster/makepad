@@ -258,7 +258,7 @@ pub fn standalone_screens(
 /// whole wide desktop): resolves `span` against the live screens and
 /// records it directly, same-process -- [`span_rect_for_window`] then
 /// gives the union rect to lay content into; no composition change.
-/// Returns false (and the recorded span is cleared) when `span` does not
+/// Returns false (and the recorded span is kept) when `span` does not
 /// resolve (unknown name, not adjacent, or -- `Current` with no
 /// primary/first screen -- no live screens; windowed Linux never has any,
 /// so it always lands here).
@@ -285,11 +285,12 @@ fn standalone_set_fullscreen_span(span: Option<ScreenSpan>) -> bool {
         &makepad_widgets_core::makepad_platform::linux_screen_names(),
     );
     let current = primary_or_first_index(&screens);
-    let (recorded, ok) = resolve_standalone_span(&screens, current, span);
+    let mut slot = STANDALONE_SPAN.lock().unwrap_or_else(|p| p.into_inner());
+    let (recorded, ok) = resolve_standalone_span(&screens, current, &slot, span);
     if !ok {
-        log!("wm_api: standalone span could not be honoured against the live screens");
+        log!("wm_api: standalone span could not be honoured against the live screens; the current one is kept");
     }
-    *STANDALONE_SPAN.lock().unwrap_or_else(|p| p.into_inner()) = recorded;
+    *slot = recorded;
     ok
 }
 

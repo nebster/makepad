@@ -2118,7 +2118,9 @@ impl Widget for WmDesk {
             // its blur footprint it can share an earlier terminal checkpoint.
             let size = cx.owning_window_or_root_pass_size();
             let dock = if self.style.weights[1] > 0.001 {
-                scope.data.get_mut::<WmState>().map(|state| (crate::desktop::dock_bounds(state, size), 4.5))
+                scope.data.get_mut::<WmState>()
+                    .filter(|state| crate::desktop::dock_shown(state))
+                    .map(|state| (crate::desktop::dock_bounds(state, size), 4.5))
             } else { None };
             let (snapshot, stacks, passes) = self.compositor.as_mut().unwrap().finish(cx, self.desk_rect, dock);
             if self.blur_counts != (stacks, passes) {

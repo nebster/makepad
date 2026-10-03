@@ -351,6 +351,33 @@ impl ScreenSet {
         Some(self.screens[self.main].rect)
     }
 
+    /// The single live screen's focused workspace holds a true
+    /// `Fullscreen` (a `Maximized` window is not one). With two or more
+    /// live screens false: a fullscreen there is a span, see
+    /// `main_fullscreen`.
+    pub fn one_screen_fullscreen(&self) -> bool {
+        if self.live_count() >= 2 {
+            return false;
+        }
+        let layout = self.active_layout();
+        let w = &layout.workspaces[layout.focus_ws()];
+        w.fullscreen.is_some() && w.fullscreen_mode == FullscreenMode::Fullscreen
+    }
+
+    /// The main screen, where the dock sits, shows a window fullscreen:
+    /// with two or more live screens, a shown span covers it (a `Current`
+    /// span of a window on it, or any span reaching it; one whose
+    /// workspace is switched away is not shown); on one screen, its
+    /// focused workspace's true `Fullscreen`. A `Maximized` window is not
+    /// fullscreen.
+    pub fn main_fullscreen(&self) -> bool {
+        let live = self.live_count();
+        if live >= 2 {
+            return self.main < live && self.spanned(self.main).is_some();
+        }
+        self.one_screen_fullscreen()
+    }
+
     /// The dock's reservation on screen `i`: the dock sits on the main
     /// screen only, so every other screen keeps its full height.
     pub fn reserved_for(&self, i: usize, reserved_bottom: f64) -> f64 {
@@ -501,6 +528,10 @@ impl ScreenSet {
             }
             self.homes.remove(&c);
             home = to;
+        }
+        // Nothing is changed past this point unless the span is taken.
+        if self.screens[home].layout.workspace_of(c).is_none() {
+            return Err(SpanError::Empty);
         }
         // Replace `c`'s own span and every span SHOWN on these screens. A
         // span on a workspace that is switched away keeps its fullscreen,
@@ -2085,6 +2116,75 @@ mod tests {
         assert_eq!(set.spanned(0), Some(1));
         assert!(!holds(&set, 10));
         assert_eq!(set.screen_of(10), Some(1));
+    }
+
+    /// A refused request leaves the client as it was: its own span, its
+    /// fullscreen and what its `WmEvent::Screens` reply reports.
+    #[test]
+    fn a_refused_span_keeps_the_clients_current_span() {
+        let mut set = three_screens();
+        set.set_span(10, &ScreenSpan::Screens(names(&["A", "B"])), GAP, RB, GO).unwrap();
+        let tile = LRect::new(1930.0, 36.0, 800.0, 600.0);
+        let before = screens_event_for(tile, &set.live_wm_screens(), set.fullscreen_span_of(10));
+        for refused in [ScreenSpan::Screens(names(&["A", "C"])), ScreenSpan::Screens(names(&["B", "Z"]))] {
+            assert!(set.set_span(10, &refused, GAP, RB, GO).is_err());
+            assert_eq!(set.span_of(10).unwrap().names, names(&["A", "B"]));
+            assert!(holds(&set, 10));
+            assert_eq!((set.spanned(0), set.spanned(1)), (Some(10), Some(10)));
+            let reply = screens_event_for(tile, &set.live_wm_screens(), set.fullscreen_span_of(10));
+            assert_eq!(reply, before);
+            assert!(matches!(reply, WmEvent::Screens { span: Some(ref s), .. } if s == &names(&["A", "B"])));
+        }
+        // A window without a span stays a normal window.
+        assert!(set.set_span(20, &ScreenSpan::Screens(names(&["A", "C"])), GAP, RB, GO).is_err());
+        assert_eq!((set.span_of(20), set.fullscreen_span_of(20)), (None, None));
+        // One screen: the request is only checked, the fullscreen stays.
+        let mut set = fallback_set();
+        let w = set.screens[0].layout.workspace_of(1).unwrap();
+        set.screens[0].layout.workspaces[w].fullscreen = Some(1);
+        set.screens[0].layout.workspaces[w].fullscreen_mode = FullscreenMode::Fullscreen;
+        let unknown = ScreenSpan::Screens(names(&["Z"]));
+        assert!(span_rect(&set.live_wm_screens(), &unknown, Some(0)).is_err());
+        assert_eq!(set.fullscreen_span_of(1), Some(vec![n("screen0")]));
+    }
+
+    /// The dock (on the main screen, A here) stands aside while a shown
+    /// span covers the main screen, whatever its home; a span elsewhere,
+    /// a hidden span or a maximized window keeps it. On one screen it is
+    /// the focused workspace's true Fullscreen.
+    #[test]
+    fn the_main_screen_is_fullscreen_under_a_shown_span_covering_it() {
+        let mut set = three_screens();
+        assert!(!set.main_fullscreen());
+        set.set_span(20, &ScreenSpan::Current, GAP, RB, GO).unwrap();
+        assert!(!set.main_fullscreen());
+        set.set_span(1, &ScreenSpan::Current, GAP, RB, GO).unwrap();
+        assert!(set.main_fullscreen());
+        assert!(set.clear_span(1));
+        assert!(!set.main_fullscreen());
+        // A span from B reaching A.
+        set.set_span(10, &ScreenSpan::Screens(names(&["A", "B"])), GAP, RB, GO).unwrap();
+        assert!(set.main_fullscreen());
+        // Its workspace switched away: not shown, the dock returns.
+        set.screens[1].layout.active = 3;
+        assert!(!set.main_fullscreen());
+        set.screens[1].layout.active = 0;
+        assert!(set.main_fullscreen());
+        assert!(set.clear_span(10));
+        // Maximized on the main screen is not fullscreen.
+        let w = set.screens[0].layout.workspace_of(1).unwrap();
+        set.screens[0].layout.workspaces[w].fullscreen = Some(1);
+        set.screens[0].layout.workspaces[w].fullscreen_mode = FullscreenMode::Maximized;
+        assert!(!set.main_fullscreen());
+        // One screen.
+        let mut set = fallback_set();
+        assert!(!set.main_fullscreen());
+        let w = set.screens[0].layout.workspace_of(1).unwrap();
+        set.screens[0].layout.workspaces[w].fullscreen = Some(1);
+        set.screens[0].layout.workspaces[w].fullscreen_mode = FullscreenMode::Fullscreen;
+        assert!(set.main_fullscreen() && set.one_screen_fullscreen());
+        set.screens[0].layout.workspaces[w].fullscreen_mode = FullscreenMode::Maximized;
+        assert!(!set.main_fullscreen());
     }
 
     #[test]

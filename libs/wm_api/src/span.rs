@@ -175,13 +175,14 @@ pub fn primary_or_first_index(screens: &[WmScreen]) -> Option<usize> {
 /// Resolve a `set_fullscreen_span` request against the live `screens` for
 /// a standalone app with no WM to answer it -- the pure core of the
 /// direct backend's `set_fullscreen_span`, and testable without a live
-/// desktop. Returns the span actually recorded (its screens' names, left
-/// to right) and whether the request was honoured, mirroring the WM's own
-/// rule: a span that cannot be resolved is dropped (recorded as `None`)
-/// rather than left stale.
+/// desktop. Returns the span to record from now on (its screens' names,
+/// left to right) and whether the request was honoured, mirroring the
+/// WM's own rule: a span that cannot be resolved changes nothing, so the
+/// span already `recorded` is kept.
 pub fn resolve_standalone_span(
     screens: &[WmScreen],
     current: Option<usize>,
+    recorded: &Option<Vec<String>>,
     span: Option<ScreenSpan>,
 ) -> (Option<Vec<String>>, bool) {
     let Some(span) = span else {
@@ -192,7 +193,7 @@ pub fn resolve_standalone_span(
             Some(screens[range].iter().map(|s| s.name.clone()).collect()),
             true,
         ),
-        Err(_) => (None, false),
+        Err(_) => (recorded.clone(), false),
     }
 }
 
@@ -465,7 +466,7 @@ mod tests {
     fn resolve_standalone_span_none_leaves_fullscreen() {
         let screens = three();
         assert_eq!(
-            resolve_standalone_span(&screens, Some(0), None),
+            resolve_standalone_span(&screens, Some(0), &Some(vec!["a".into()]), None),
             (None, true)
         );
     }
@@ -474,7 +475,7 @@ mod tests {
     fn resolve_standalone_span_resolves_a_subset() {
         let screens = three();
         let span = ScreenSpan::Screens(vec!["b".into(), "c".into()]);
-        let (recorded, ok) = resolve_standalone_span(&screens, None, Some(span));
+        let (recorded, ok) = resolve_standalone_span(&screens, None, &None, Some(span));
         assert!(ok);
         assert_eq!(recorded, Some(vec!["b".into(), "c".into()]));
     }
@@ -482,7 +483,7 @@ mod tests {
     #[test]
     fn resolve_standalone_span_resolves_all() {
         let screens = three();
-        let (recorded, ok) = resolve_standalone_span(&screens, None, Some(ScreenSpan::All));
+        let (recorded, ok) = resolve_standalone_span(&screens, None, &None, Some(ScreenSpan::All));
         assert!(ok);
         assert_eq!(recorded, Some(vec!["a".into(), "b".into(), "c".into()]));
     }
@@ -491,27 +492,31 @@ mod tests {
     fn resolve_standalone_span_resolves_current_via_the_given_index() {
         let screens = three();
         let (recorded, ok) =
-            resolve_standalone_span(&screens, Some(1), Some(ScreenSpan::Current));
+            resolve_standalone_span(&screens, Some(1), &None, Some(ScreenSpan::Current));
         assert!(ok);
         assert_eq!(recorded, Some(vec!["b".into()]));
     }
 
     #[test]
-    fn resolve_standalone_span_unresolvable_is_dropped() {
+    fn resolve_standalone_span_unresolvable_keeps_the_record() {
         let screens = three();
         let span = ScreenSpan::Screens(vec!["a".into(), "c".into()]); // not adjacent
-        let (recorded, ok) = resolve_standalone_span(&screens, None, Some(span));
+        let before = Some(vec!["b".into()]);
+        let (recorded, ok) = resolve_standalone_span(&screens, None, &before, Some(span.clone()));
         assert!(!ok);
-        assert_eq!(recorded, None);
+        assert_eq!(recorded, before);
+        // Nothing recorded stays nothing.
+        assert_eq!(resolve_standalone_span(&screens, None, &None, Some(span)), (None, false));
     }
 
     #[test]
-    fn resolve_standalone_span_unknown_name_is_dropped() {
+    fn resolve_standalone_span_unknown_name_keeps_the_record() {
         let screens = three();
         let span = ScreenSpan::Screens(vec!["z".into()]);
-        let (recorded, ok) = resolve_standalone_span(&screens, None, Some(span));
+        let before = Some(vec!["a".into(), "b".into()]);
+        let (recorded, ok) = resolve_standalone_span(&screens, None, &before, Some(span));
         assert!(!ok);
-        assert_eq!(recorded, None);
+        assert_eq!(recorded, before);
     }
 
     #[test]

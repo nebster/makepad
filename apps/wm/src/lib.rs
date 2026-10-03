@@ -1492,9 +1492,10 @@ impl App {
     /// `clear_span`; on one screen it is today's single-desk fullscreen
     /// (any span that resolves there covers that one screen). A span that
     /// cannot be honoured (an unknown or non-adjacent screen, a client
-    /// that is not on a live screen) is logged and the client leaves
-    /// fullscreen, so the `WmEvent::Screens` it is sent next carries
-    /// `span: None` and matches what the desk shows.
+    /// that is not on a live screen) is logged and changes nothing: the
+    /// client keeps the span or fullscreen it had (or stays a normal
+    /// window), and is sent its `WmEvent::Screens` again, whose `span`
+    /// (`fullscreen_span_of`) says what it still covers.
     fn set_client_span(&mut self, cx: &mut Cx, client: ClientId, span: Option<ScreenSpan>) {
         let state = self.state_mut();
         let several = state.screens.live_count() >= 2;
@@ -1516,8 +1517,7 @@ impl App {
         };
         match result {
             Err(err) => {
-                log!("wm: client {} cannot span {:?}: {:?}", client, span, err);
-                self.state_mut().screens.clear_span(client);
+                log!("wm: client {} cannot span {:?}: {:?}; it keeps its current state", client, span, err);
                 self.resend_screens_event(client);
             }
             Ok(()) if several => {
@@ -4189,15 +4189,7 @@ impl App {
     /// SUPER+F hides the bar with the window; anything that leaves
     /// fullscreen puts it back, unless SUPER+SHIFT+SPACE hid it.
     fn sync_bar_for_fullscreen(&mut self, cx: &mut Cx) {
-        let fullscreen = {
-            let state = self.state_mut();
-            let several = state.screens.live_count() >= 2;
-            let layout = state.layout();
-            let ws = layout.focus_ws();
-            layout.workspaces[ws].fullscreen.is_some()
-                && layout.workspaces[ws].fullscreen_mode == FullscreenMode::Fullscreen
-                && !several
-        };
+        let fullscreen = self.state_mut().screens.one_screen_fullscreen();
         let bar = self.ui.widget(cx, ids!(bar));
         if fullscreen && bar.visible() {
             bar.set_visible(cx, false);
