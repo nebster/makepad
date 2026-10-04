@@ -20,6 +20,7 @@ use makepad_widgets::*;
 
 mod ai_bus;
 mod apps;
+mod autostart;
 mod binds;
 mod build;
 mod clients;
@@ -518,6 +519,9 @@ pub struct App {
     /// `--gallery`: the shell-surface gallery instead of a desktop.
     #[rust]
     gallery: bool,
+    /// The autostart list ran (`run_autostart`): once per process.
+    #[rust]
+    autostarted: bool,
     /// What the WM does for hosted children that have no OS window or JVM
     /// of their own (HTTP with TLS, the clipboard menu, URLs, permission
     /// prompts, file pickers): platform hosted_relay.rs.
@@ -867,6 +871,50 @@ impl App {
     // --------------------------------------------------------------
     // Client lifecycle
     // --------------------------------------------------------------
+
+    /// Open the apps listed in `~/.makepad/wm/autostart` (autostart.rs),
+    /// once per process, each through `launch_app` as if picked from the
+    /// menu, in file order. Test scenes and scripted runs skip it; ids the
+    /// registry does not know, or this build cannot start, are logged.
+    fn run_autostart(&mut self, cx: &mut Cx) {
+        if self.autostarted {
+            return;
+        }
+        self.autostarted = true;
+        let args: Vec<String> = std::env::args().collect();
+        if let Some(reason) = autostart::suppressed(&args, |name| std::env::var(name).ok()) {
+            log!("wm: autostart: off ({})", reason);
+            return;
+        }
+        let text = match autostart::read_text(&autostart::path()) {
+            Ok(text) => text,
+            Err(err) => {
+                log!("wm: autostart: cannot read {}", err);
+                return;
+            }
+        };
+        let ids = autostart::parse(&text);
+        if ids.is_empty() {
+            return;
+        }
+        let launchable = self.state_mut().launchable.clone();
+        let steps = autostart::plan(&ids, |id| match crate::clients::find_app(id) {
+            None => autostart::Resolved::Unknown,
+            Some(app) if !launchable.allows(&app) => autostart::Resolved::Unavailable,
+            Some(app) => autostart::Resolved::App(app.id),
+        });
+        for step in steps {
+            match step {
+                autostart::Step::Launch(id) => {
+                    log!("wm: autostart: launching {}", id);
+                    self.launch_app(cx, &id);
+                }
+                autostart::Step::Skip { id, reason } => {
+                    log!("wm: autostart: skipping '{}': {}", id, reason);
+                }
+            }
+        }
+    }
 
     fn launch_app(&mut self, cx: &mut Cx, app_id: &str) {
         #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
@@ -5359,6 +5407,8 @@ impl MatchEvent for App {
                 self.launch_app(cx, &app);
             }
         }
+        // The user's autostart list (not with a test scene or a script).
+        self.run_autostart(cx);
 
         self.apply_background(cx, 0);
         self.fetch_backgrounds_if_missing(cx);
