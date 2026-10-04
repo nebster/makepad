@@ -1703,6 +1703,155 @@ fn compare_routes(left: &WireRoute, right: &WireRoute) -> Ordering {
         .then_with(|| compare_shape(left, right))
 }
 
+/// One straight run of an orthogonal route that may move sideways: run
+/// `index` goes from corner `index` to corner `index + 1`, and neither of
+/// those corners is an end of the cable.
+#[derive(Clone, Copy, Debug)]
+struct Run {
+    route: usize,
+    index: usize,
+    vertical: bool,
+    /// x of a vertical run, y of a horizontal one.
+    at: f64,
+    low: f64,
+    high: f64,
+}
+
+fn movable_runs(route_index: usize, route: &WireRoute) -> Vec<Run> {
+    let RouteKind::Orthogonal { points, .. } = &route.kind else { return Vec::new() };
+    if points.len() < 4 {
+        return Vec::new();
+    }
+    (1..points.len() - 2)
+        .filter_map(|index| {
+            let (a, b) = (points[index], points[index + 1]);
+            let vertical = (a.x - b.x).abs() < 1e-6;
+            if !vertical && (a.y - b.y).abs() >= 1e-6 {
+                return None;
+            }
+            let (at, low, high) = if vertical { (a.x, a.y.min(b.y), a.y.max(b.y)) } else { (a.y, a.x.min(b.x), a.x.max(b.x)) };
+            (high - low > 1e-6).then_some(Run { route: route_index, index, vertical, at, low, high })
+        })
+        .collect()
+}
+
+/// Lanes for cables that share a corridor. Two interior runs of different
+/// cables share one when they lie the same way, closer together than
+/// `spacing`, and overlap along their length by more than a unit; runs
+/// linked that way form one corridor. A corridor of `n` runs is spread over
+/// `n` lanes `spacing` apart, centred on where its runs were, in the order
+/// of where they start along the corridor (then where they end, then the
+/// cable's index), so the order is the same on every draw. The result has
+/// one list per route of `(run, offset)`: run `i` goes from corner `i` to
+/// corner `i + 1` of the route's corner points, and the offset moves it
+/// sideways (x for a vertical run, y for a horizontal one). A run that
+/// shares no corridor is not listed, and runs touching a cable's ends never
+/// move: cables leaving one port share that point, not a corridor. Cubic
+/// routes have no runs.
+pub fn lane_offsets(routes: &[&WireRoute], spacing: f64) -> Vec<Vec<(usize, f64)>> {
+    let runs: Vec<Run> = routes.iter().enumerate().flat_map(|(index, route)| movable_runs(index, route)).collect();
+    // Union-find over the runs that share a corridor.
+    let mut parent: Vec<usize> = (0..runs.len()).collect();
+    fn root(parent: &mut [usize], mut at: usize) -> usize {
+        while parent[at] != at {
+            parent[at] = parent[parent[at]];
+            at = parent[at];
+        }
+        at
+    }
+    for left in 0..runs.len() {
+        for right in left + 1..runs.len() {
+            let (a, b) = (runs[left], runs[right]);
+            let shared = a.route != b.route
+                && a.vertical == b.vertical
+                && (a.at - b.at).abs() < spacing - 1e-6
+                && a.high.min(b.high) - a.low.max(b.low) > 1.0;
+            if shared {
+                let (ra, rb) = (root(&mut parent, left), root(&mut parent, right));
+                parent[ra.max(rb)] = ra.min(rb);
+            }
+        }
+    }
+    let mut corridors: Vec<Vec<usize>> = Vec::new();
+    let mut corridor_of: Vec<Option<usize>> = vec![None; runs.len()];
+    for at in 0..runs.len() {
+        let r = root(&mut parent, at);
+        let corridor = *corridor_of[r].get_or_insert_with(|| {
+            corridors.push(Vec::new());
+            corridors.len() - 1
+        });
+        corridors[corridor].push(at);
+    }
+    let mut offsets = vec![Vec::new(); routes.len()];
+    for mut corridor in corridors.into_iter().filter(|corridor| corridor.len() > 1) {
+        corridor.sort_by(|&l, &r| {
+            let (a, b) = (runs[l], runs[r]);
+            a.low
+                .partial_cmp(&b.low)
+                .unwrap_or(Ordering::Equal)
+                .then(a.high.partial_cmp(&b.high).unwrap_or(Ordering::Equal))
+                .then(a.route.cmp(&b.route))
+                .then(a.index.cmp(&b.index))
+        });
+        let n = corridor.len() as f64;
+        let centre = corridor.iter().map(|&at| runs[at].at).sum::<f64>() / n;
+        for (lane, at) in corridor.into_iter().enumerate() {
+            let run = runs[at];
+            let target = centre + (lane as f64 - (n - 1.0) * 0.5) * spacing;
+            offsets[run.route].push((run.index, target - run.at));
+        }
+    }
+    for list in &mut offsets {
+        list.sort_by_key(|(index, _)| *index);
+    }
+    offsets
+}
+
+/// The routes with their shared corridors spread into lanes (see
+/// [`lane_offsets`]); `None` for a route that stays as it was. A run moves
+/// only when the move keeps every run of the cable pointing the way it did
+/// (a short stub is never turned back), keeps the stubs at the cards'
+/// clearance, and does not take the moved runs into any of `keep_out` that
+/// they were not already in (pass the cards' solid bodies). A run that
+/// cannot move stays in the corridor's middle; the others still take their
+/// lanes. The route's routing shape is kept, so a later routing of the
+/// cable can start from what the router chose rather than from its lane.
+pub fn separate_lanes(routes: &[&WireRoute], spacing: f64, keep_out: &[Obstacle]) -> Vec<Option<WireRoute>> {
+    lane_offsets(routes, spacing)
+        .into_iter()
+        .zip(routes)
+        .map(|(offsets, route)| {
+            let RouteKind::Orthogonal { points, radius } = &route.kind else { return None };
+            let mut moved = points.clone();
+            let mut any = false;
+            for (index, offset) in offsets {
+                let mut next = moved.clone();
+                for corner in [index, index + 1] {
+                    if (moved[index].x - moved[index + 1].x).abs() < 1e-6 {
+                        next[corner].x += offset;
+                    } else {
+                        next[corner].y += offset;
+                    }
+                }
+                let keeps_direction = moved.windows(2).zip(next.windows(2)).all(|(old, new)| {
+                    (old[1].x - old[0].x) * (new[1].x - new[0].x) + (old[1].y - old[0].y) * (new[1].y - new[0].y) > 1e-6
+                });
+                let touched = index.saturating_sub(1)..(index + 2).min(next.len() - 1);
+                let newly_blocked = keep_out.iter().any(|rect| {
+                    touched.clone().any(|run| {
+                        !segment_clear_rect(next[run], next[run + 1], *rect) && segment_clear_rect(moved[run], moved[run + 1], *rect)
+                    })
+                });
+                if keeps_direction && valid_orthogonal(&next) && !newly_blocked {
+                    moved = next;
+                    any = true;
+                }
+            }
+            any.then(|| build_orthogonal_route(route.from, route.to, moved, *radius, route.topology))
+        })
+        .collect()
+}
+
 fn route_choice_rank(choice: RouteChoice) -> u8 {
     match choice {
         RouteChoice::Straight => 0,
@@ -2532,5 +2681,103 @@ mod tests {
         );
         let (_, tangent) = route.midpoint_tangent();
         assert!(tangent.x > 0.0, "{tangent:?}");
+    }
+
+    fn corners(points: &[(f64, f64)]) -> WireRoute {
+        let points: Vec<Point> = points.iter().map(|(x, y)| Point::new(*x, *y)).collect();
+        build_orthogonal_route(points[0], points[points.len() - 1], points, 16.0, Topology::Straight)
+    }
+
+    fn corner_points(route: &WireRoute) -> Vec<Point> {
+        match &route.kind {
+            RouteKind::Orthogonal { points, .. } => points.clone(),
+            RouteKind::Cubic { .. } => panic!("an orthogonal route"),
+        }
+    }
+
+    #[test]
+    fn two_runs_sharing_a_spine_get_distinct_lanes() {
+        // Both cables turn down the column x = 100 and overlap from y 50 to 200.
+        let a = corners(&[(0.0, 0.0), (100.0, 0.0), (100.0, 200.0), (200.0, 200.0)]);
+        let b = corners(&[(0.0, 50.0), (100.0, 50.0), (100.0, 300.0), (200.0, 300.0)]);
+        let spacing = RouteStyle::default().cable_spacing;
+        let lanes = lane_offsets(&[&a, &b], spacing);
+        assert_eq!(lanes[0].len(), 1, "{lanes:?}");
+        assert_eq!(lanes[1].len(), 1, "{lanes:?}");
+        let (da, db) = (lanes[0][0], lanes[1][0]);
+        assert_eq!((da.0, db.0), (1, 1), "the spine is each route's second run");
+        assert!((da.1 - db.1).abs() >= spacing - 1e-9, "{da:?} {db:?}");
+        // Centred on the corridor they shared.
+        assert!((da.1 + db.1).abs() < 1e-9, "{da:?} {db:?}");
+
+        let laned = separate_lanes(&[&a, &b], spacing, &[]);
+        let (a2, b2) = (laned[0].clone().expect("a moved"), laned[1].clone().expect("b moved"));
+        let (pa, pb) = (corner_points(&a2), corner_points(&b2));
+        assert!((pa[1].x - pb[1].x).abs() >= spacing - 1e-9, "{pa:?} {pb:?}");
+        assert_eq!((a2.from, a2.to), (a.from, a.to));
+        assert_eq!((b2.from, b2.to), (b.from, b.to));
+        assert!(valid_orthogonal(&pa) && valid_orthogonal(&pb));
+        assert_eq!(a2.topology, a.topology, "the router's own choice is kept");
+    }
+
+    #[test]
+    fn three_runs_in_one_row_take_three_lanes() {
+        let a = corners(&[(0.0, 0.0), (0.0, 100.0), (300.0, 100.0), (300.0, 200.0)]);
+        let b = corners(&[(20.0, 0.0), (20.0, 100.0), (250.0, 100.0), (250.0, 220.0)]);
+        let c = corners(&[(40.0, 0.0), (40.0, 103.0), (280.0, 103.0), (280.0, 240.0)]);
+        let spacing = 8.0;
+        let laned = separate_lanes(&[&a, &b, &c], spacing, &[]);
+        let mut rows: Vec<f64> = laned.iter().map(|route| corner_points(route.as_ref().unwrap())[1].y).collect();
+        rows.sort_by(|l, r| l.partial_cmp(r).unwrap());
+        assert!(rows[1] - rows[0] >= spacing - 1e-9 && rows[2] - rows[1] >= spacing - 1e-9, "{rows:?}");
+    }
+
+    #[test]
+    fn a_lone_run_and_runs_apart_keep_their_place() {
+        let spacing = 8.0;
+        let a = corners(&[(0.0, 0.0), (100.0, 0.0), (100.0, 200.0), (200.0, 200.0)]);
+        assert_eq!(lane_offsets(&[&a], spacing), vec![Vec::<(usize, f64)>::new()]);
+        assert_eq!(separate_lanes(&[&a], spacing, &[]), vec![None]);
+        // A lane apart already, or the same column but rows that do not overlap.
+        let apart = corners(&[(0.0, 50.0), (108.0, 50.0), (108.0, 300.0), (200.0, 300.0)]);
+        let below = corners(&[(0.0, 250.0), (100.0, 250.0), (100.0, 400.0), (200.0, 400.0)]);
+        assert_eq!(lane_offsets(&[&a, &apart, &below], spacing), vec![Vec::new(), Vec::new(), Vec::new()]);
+        // Runs that touch an endpoint never move: a fan-out from one port is
+        // one point, not a corridor.
+        let fan_a = corners(&[(0.0, 0.0), (300.0, 0.0)]);
+        let fan_b = corners(&[(0.0, 0.0), (300.0, 0.0)]);
+        assert_eq!(lane_offsets(&[&fan_a, &fan_b], spacing), vec![Vec::new(), Vec::new()]);
+    }
+
+    #[test]
+    fn a_lane_never_moves_into_a_card() {
+        let spacing = 8.0;
+        let a = corners(&[(0.0, 0.0), (100.0, 0.0), (100.0, 200.0), (200.0, 200.0)]);
+        let b = corners(&[(0.0, 50.0), (100.0, 50.0), (100.0, 300.0), (200.0, 300.0)]);
+        let offsets = lane_offsets(&[&a, &b], spacing);
+        // A card's body just beside the spine on whichever side `a` would move to.
+        let side = offsets[0][0].1.signum();
+        let wall = if side > 0.0 { Obstacle::from_xywh(102.0, 60.0, 40.0, 100.0) } else { Obstacle::from_xywh(58.0, 60.0, 40.0, 100.0) };
+        let laned = separate_lanes(&[&a, &b], spacing, &[wall]);
+        assert_eq!(laned[0], None, "a stays where the router put it");
+        assert!(laned[1].is_some(), "b still takes its own lane");
+    }
+
+    #[test]
+    fn a_lane_never_turns_a_run_back() {
+        // The middle run sits 3 units from the source's column: moving it
+        // 4 units left would make the cable double back on itself.
+        let a = corners(&[(0.0, 0.0), (0.0, 3.0), (100.0, 3.0), (100.0, 200.0)]);
+        let b = corners(&[(-10.0, 0.0), (-10.0, 3.0), (90.0, 3.0), (90.0, 200.0)]);
+        for (route, laned) in [&a, &b].into_iter().zip(separate_lanes(&[&a, &b], 8.0, &[])) {
+            if let Some(laned) = laned {
+                let (before, after) = (corner_points(route), corner_points(&laned));
+                assert!(valid_orthogonal(&after), "{after:?}");
+                for (old, new) in before.windows(2).zip(after.windows(2)) {
+                    let dot = (old[1].x - old[0].x) * (new[1].x - new[0].x) + (old[1].y - old[0].y) * (new[1].y - new[0].y);
+                    assert!(dot > 0.0, "{before:?} -> {after:?}");
+                }
+            }
+        }
     }
 }

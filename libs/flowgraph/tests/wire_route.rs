@@ -224,3 +224,30 @@ fn screenshot_drag_from_saved_position_never_takes_an_outside_row() {
         }
     }
 }
+
+#[test]
+fn routed_cables_sharing_a_corridor_are_drawn_in_separate_lanes() {
+    use makepad_flowgraph::wire_route::separate_lanes;
+    // Two cables between two pairs of cards one row apart: the router puts
+    // both spines in the one channel between the columns.
+    let cards = [
+        Obstacle::from_xywh(-300.0, -20.0, 300.0, 120.0),
+        Obstacle::from_xywh(500.0, 280.0, 300.0, 120.0),
+    ];
+    let inflated: Vec<Obstacle> = cards.iter().map(|card| card.inflate(CLEARANCE)).collect();
+    let style = RouteStyle::default();
+    let one = route_wire(Point::new(0.0, 20.0), PortSide::Right, Point::new(500.0, 320.0), PortSide::Left, &inflated, style, 0.0);
+    let two = route_wire(Point::new(0.0, 60.0), PortSide::Right, Point::new(500.0, 360.0), PortSide::Left, &inflated, style, 0.0);
+    let spine = |route: &WireRoute| match &route.kind {
+        RouteKind::Orthogonal { points, .. } => points.windows(2).find(|pair| pair[0].x == pair[1].x).map(|pair| pair[0].x).unwrap(),
+        RouteKind::Cubic { .. } => panic!("expected orthogonal geometry"),
+    };
+    assert_eq!(spine(&one), spine(&two), "the fixture's cables coincide before lanes");
+    let laned = separate_lanes(&[&one, &two], style.cable_spacing, &cards);
+    let (one, two) = (laned[0].clone().unwrap(), laned[1].clone().unwrap());
+    assert!((spine(&one) - spine(&two)).abs() >= style.cable_spacing - 1e-9);
+    assert_port_directions(&one, PortSide::Right, PortSide::Left);
+    assert_port_directions(&two, PortSide::Right, PortSide::Left);
+    assert_outside_cards(&one, &cards);
+    assert_outside_cards(&two, &cards);
+}

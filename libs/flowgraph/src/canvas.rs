@@ -925,7 +925,23 @@ fn prioritize_canvas_hit(card: Option<usize>, wire: Option<usize>) -> CanvasHit 
 
 struct CachedWire {
     key: u64,
+    /// What the router chose: the next routing of this cable starts from it.
     route: WireRoute,
+    /// The same cable moved into its own lane where it shares a corridor
+    /// with others (`wire_route::separate_lanes`); `None` when it shares
+    /// none. Drawing and hit-testing use `drawn`.
+    laned: Option<WireRoute>,
+}
+
+impl CachedWire {
+    fn new(key: u64, route: WireRoute) -> Self {
+        Self { key, route, laned: None }
+    }
+
+    /// The route as drawn and hit-tested.
+    fn drawn(&self) -> &WireRoute {
+        self.laned.as_ref().unwrap_or(&self.route)
+    }
 }
 
 /// The cable just connected from a drag, by the names its edge will have:
@@ -1911,7 +1927,7 @@ impl FlowCanvas {
                     let seeds = pending.as_ref().is_some_and(|pending| {
                         pending.from == *from && pending.from_port == *from_port && pending.to == *to && pending.to_port == *to_port
                     });
-                    seeds.then(|| CachedWire { key: 0, route: pending.take().expect("checked just above").route })
+                    seeds.then(|| CachedWire::new(0, pending.take().expect("checked just above").route))
                 })
                 .collect()
         };
@@ -2552,7 +2568,7 @@ impl FlowCanvas {
             .enumerate()
             .filter_map(|(index, cached)| {
                 if picked_up.is_some_and(|edge| self.edges.get(index) == Some(&edge)) { return None; }
-                let distance = cached.as_ref()?.route.distance_to_point(point);
+                let distance = cached.as_ref()?.drawn().distance_to_point(point);
                 (distance <= threshold).then_some((index, distance))
             })
             .min_by(|left, right| {
@@ -2937,9 +2953,32 @@ impl FlowCanvas {
                     route.describe(),
                 );
             }
-            self.wire_cache[index] = Some(CachedWire { key, route });
+            self.wire_cache[index] = Some(CachedWire::new(key, route));
         }
+        self.separate_wire_lanes(&all_obstacles);
         self.wire_cache_dirty = false;
+    }
+
+    /// Spread cables that run side by side in one corridor into lanes a
+    /// cable spacing apart, so no two coincide. Each cable keeps the route
+    /// the router chose as its next starting point; only what is drawn and
+    /// hit-tested moves. A lane never takes a run into a card's body.
+    fn separate_wire_lanes(&mut self, obstacles: &[Obstacle]) {
+        const CARD_CLEARANCE: f64 = 12.0;
+        if self.wire_mode != WireMode::Routed {
+            self.wire_cache.iter_mut().flatten().for_each(|cached| cached.laned = None);
+            return;
+        }
+        // The cards' own rectangles: a deflation stops at a slot's body.
+        let bodies: Vec<Obstacle> = obstacles.iter().map(|obstacle| obstacle.inflate(-CARD_CLEARANCE)).collect();
+        let cached: Vec<usize> = (0..self.wire_cache.len()).filter(|index| self.wire_cache[*index].is_some()).collect();
+        let routes: Vec<&WireRoute> = cached.iter().map(|index| &self.wire_cache[*index].as_ref().unwrap().route).collect();
+        let laned = wire_route::separate_lanes(&routes, RouteStyle::default().cable_spacing, &bodies);
+        for (index, laned) in cached.into_iter().zip(laned) {
+            if let Some(cached) = self.wire_cache[index].as_mut() {
+                cached.laned = laned;
+            }
+        }
     }
 
     fn flip_animation_active(&self, graph: &Graph) -> bool {
@@ -3233,7 +3272,7 @@ impl FlowCanvas {
                 route.describe(),
             );
         }
-        self.preview_wire = Some(CachedWire { key, route: route.clone() });
+        self.preview_wire = Some(CachedWire::new(key, route.clone()));
         self.preview_edge = Some(edge);
         route
     }
@@ -3401,7 +3440,7 @@ impl FlowCanvas {
                     from: source.id.clone(), from_port: source.outputs[edge.from_port].name.clone(),
                     to: target.id.clone(), to_port: target.inputs[edge.to_port].name.clone(), key: edge.key,
                 };
-                observed[index] = host.faces().draw_wire(cx, &view, &cached.route, &viewport);
+                observed[index] = host.faces().draw_wire(cx, &view, cached.drawn(), &viewport);
             }
         }
         self.draw_vec.begin();
@@ -3431,7 +3470,7 @@ impl FlowCanvas {
                     _ => None,
                 }
             });
-            let Some(route) = self.wire_cache[index].as_ref().map(|cached| &cached.route) else {
+            let Some(route) = self.wire_cache[index].as_ref().map(CachedWire::drawn) else {
                 continue;
             };
             if streaming {
@@ -3590,7 +3629,7 @@ impl FlowCanvas {
             const ACCENT_LENGTH: f64 = 22.0;
             let accents = boundary_accents(&self.boundary_links);
             for (index, edge) in self.edges.iter().copied().enumerate() {
-                let Some(route) = self.wire_cache[index].as_ref().map(|cached| &cached.route) else {
+                let Some(route) = self.wire_cache[index].as_ref().map(CachedWire::drawn) else {
                     continue;
                 };
                 let length = route.length();
@@ -4543,6 +4582,7 @@ impl FlowCanvas {
             let offset = Self::route_point(origin_shift);
             for cached in self.wire_cache.iter_mut().flatten() {
                 cached.route.translate(offset);
+                if let Some(laned) = cached.laned.as_mut() { laned.translate(offset); }
             }
             if let Some(preview) = self.preview_wire.as_mut() { preview.route.translate(offset); }
             if let Some(pending) = self.pending_connect.as_mut() { pending.route.translate(offset); }
