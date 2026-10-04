@@ -193,6 +193,8 @@ pub fn omarchy_tree() -> Vec<MenuItem> {
     ] {
         child("style", leaf, label, MenuKind::Action);
     }
+    // Start at login is Setup's first child: its one live row.
+    child("setup", "autostart", "Start at login", MenuKind::Menu);
     for (leaf, label) in [
         ("monitors", "Monitors"),
         ("keybindings", "Keybindings"),
@@ -298,6 +300,13 @@ pub fn omarchy_tree() -> Vec<MenuItem> {
             &["bar", "top bar"],
             "Show or hide the top bar",
         ),
+        (
+            AUTOSTART_MENU,
+            MenuKind::Menu,
+            Some(Ico::Play),
+            &["autostart", "startup", "login"],
+            "Apps that open when the desktop starts",
+        ),
         ("apps", MenuKind::Menu, Some(Ico::Menu), &[], ""),
     ];
     for (id, kind, ico, aliases, desc) in live {
@@ -322,6 +331,8 @@ pub fn omarchy_tree() -> Vec<MenuItem> {
         "style.theme",
         "style.background",
         "style.bar",
+        "setup",
+        AUTOSTART_MENU,
         "system",
     ];
     for item in v.iter_mut() {
@@ -330,6 +341,39 @@ pub fn omarchy_tree() -> Vec<MenuItem> {
         }
     }
     v
+}
+
+/// Setup > Start at login: the submenu that edits `~/.makepad/wm/autostart`.
+pub const AUTOSTART_MENU: &str = "setup.autostart";
+
+/// One Action row per Apps-menu row: id "setup.autostart.<app id>", the
+/// app's label and icon, checked when `enabled` lists the app id. Pure.
+/// Ids in `enabled` that no row has (hidden, unknown, unavailable here)
+/// make no row.
+fn autostart_items(app_rows: Vec<MenuItem>, enabled: &[String]) -> Vec<MenuItem> {
+    app_rows
+        .into_iter()
+        .filter_map(|row| {
+            let id = row.id.strip_prefix("apps.")?.to_string();
+            let mut item = MenuItem::new(
+                &format!("{AUTOSTART_MENU}.{id}"),
+                &row.label,
+                MenuKind::Action,
+            )
+            .aliases(&[id.as_str()]);
+            item.icon = row.icon;
+            item.checked = enabled.contains(&id);
+            Some(item)
+        })
+        .collect()
+}
+
+/// "setup.autostart.<id>" -> Some("<id>"); anything else None.
+pub fn autostart_target(target: &str) -> Option<&str> {
+    target
+        .strip_prefix(AUTOSTART_MENU)?
+        .strip_prefix('.')
+        .filter(|id| !id.is_empty())
 }
 
 /// The `style.theme` submenu: every installed theme, then the import list.
@@ -451,7 +495,7 @@ impl Default for MenuModel {
 
 impl MenuModel {
     /// Every item of the tree plus the providers that are live under the
-    /// current path (`style.theme`, `learn.keybindings`).
+    /// current path (`style.theme`, `learn.keybindings`, `setup.autostart`).
     ///
     /// The `apps` provider is ALWAYS in the index, whatever the path:
     /// `Menu.qml` searches every descendant of the open menu, so typing
@@ -497,6 +541,14 @@ impl MenuModel {
         if path.starts_with("learn.keybindings") {
             items.extend(key_items());
         }
+        if path.starts_with(AUTOSTART_MENU) {
+            // Read fresh each time the submenu opens, like `theme_items`.
+            // An unreadable file ticks nothing; a toggle reports the error.
+            let enabled = crate::autostart::read_text(&crate::autostart::path())
+                .map(|text| crate::autostart::parse(&text))
+                .unwrap_or_default();
+            items.extend(autostart_items(launcher::apps(launchable), &enabled));
+        }
         items
     }
 
@@ -511,6 +563,14 @@ impl MenuModel {
         self.frozen_top = None;
         self.items = Self::all_items(path, &self.launchable);
         self.rebuild();
+    }
+
+    /// Put the cursor on the row whose target is `target` (no change when
+    /// absent).
+    pub fn select_target(&mut self, target: &str) {
+        if let Some(index) = self.rows.iter().position(|row| row.target == target) {
+            self.sel = index;
+        }
     }
 
     pub fn close(&mut self) {
@@ -1030,6 +1090,16 @@ impl ShellMenu {
         self.model.open_at(path, skin);
         self.next = nextstep::NextMenus::default();
         self.gate.reset();
+        self.redraw(cx);
+    }
+
+    /// Put the cursor on `target`'s row and scroll it into view (the WM
+    /// reopens Setup > Start at login on the row just toggled).
+    pub fn select_target(&mut self, cx: &mut Cx, target: &str) {
+        self.model.select_target(target);
+        if self.screen.size.x > 0.0 && self.screen.size.y > 0.0 && self.layout_card(self.screen).1 > 0 {
+            self.follow_cursor(self.screen);
+        }
         self.redraw(cx);
     }
 
@@ -1686,6 +1756,94 @@ mod tests {
         assert!(gate.moved(dvec2(10.0, 13.2)));
         gate.reset();
         assert!(gate.moved(dvec2(10.0, 12.0)));
+    }
+
+    #[test]
+    fn setup_and_start_at_login_are_live() {
+        let tree = omarchy_tree();
+        let find = |id: &str| tree.iter().find(|i| i.id == id).unwrap();
+        assert!(!find("setup").disabled);
+        assert!(!find("setup.autostart").disabled);
+        assert!(find("setup.monitors").disabled);
+        let first_child = tree.iter().find(|i| i.parent() == "setup").unwrap();
+        assert_eq!(first_child.id, AUTOSTART_MENU);
+        assert_eq!(first_child.kind, MenuKind::Menu);
+    }
+
+    fn fake_app_rows() -> Vec<MenuItem> {
+        vec![
+            MenuItem::new("apps.clock", "Clock", MenuKind::App).icon(Ico::Calendar),
+            MenuItem::new("apps.terminal", "Terminal", MenuKind::App).icon(Ico::Keyboard),
+            MenuItem::new("apps.spacecraft", "Spacecraft", MenuKind::App).icon(Ico::Dot),
+        ]
+    }
+
+    #[test]
+    fn autostart_rows_follow_the_apps_rows_and_tick_the_listed_ones() {
+        let enabled = vec!["spacecraft".to_string(), "gone".to_string()];
+        let rows = autostart_items(fake_app_rows(), &enabled);
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["setup.autostart.clock", "setup.autostart.terminal", "setup.autostart.spacecraft"]
+        );
+        assert!(rows.iter().all(|r| r.kind == MenuKind::Action));
+        let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(labels, vec!["Clock", "Terminal", "Spacecraft"]);
+        assert_eq!(rows[0].icon, Some(Ico::Calendar));
+        assert_eq!(rows[1].icon, Some(Ico::Keyboard));
+        assert_eq!(rows[2].icon, Some(Ico::Dot));
+        let checked: Vec<bool> = rows.iter().map(|r| r.checked).collect();
+        assert_eq!(checked, vec![false, false, true]);
+        assert_eq!(rows[2].aliases, vec!["spacecraft".to_string()]);
+        assert!(rows.iter().all(|r| r.description.is_empty() && !r.disabled));
+    }
+
+    #[test]
+    fn a_ticked_autostart_row_reads_with_the_tick() {
+        let rows = autostart_items(fake_app_rows(), &["spacecraft".to_string()]);
+        let m = MenuModel::default();
+        let row = m.row_for(&rows[2], String::new(), false);
+        assert_eq!(row.label, "Spacecraft \u{2713}");
+        assert_eq!(m.row_for(&rows[0], String::new(), false).label, "Clock");
+    }
+
+    #[test]
+    fn autostart_target_parses_only_its_own_rows() {
+        assert_eq!(autostart_target("setup.autostart.spacecraft"), Some("spacecraft"));
+        assert_eq!(autostart_target("setup.autostart"), None);
+        assert_eq!(autostart_target("setup.autostart."), None);
+        assert_eq!(autostart_target("apps.spacecraft"), None);
+    }
+
+    #[test]
+    fn select_target_moves_the_cursor() {
+        let mut m = MenuModel::default();
+        let row = |target: &str| MenuRow {
+            label: target.to_string(),
+            detail: String::new(),
+            icon: None,
+            target: target.to_string(),
+            kind: MenuKind::Action,
+            disabled: false,
+            has_children: false,
+            divider: false,
+        };
+        m.rows = vec![row("a"), row("b"), row("c")];
+        m.select_target("c");
+        assert_eq!(m.sel, 2);
+        m.select_target("missing");
+        assert_eq!(m.sel, 2);
+    }
+
+    #[test]
+    fn browsing_setup_shows_start_at_login_first() {
+        let mut m = MenuModel::default();
+        m.open_at("setup", MenuSkin::Menu);
+        assert_eq!(m.rows[0].target, "setup.autostart");
+        assert!(!m.rows[0].disabled);
+        assert!(m.rows[0].has_children);
+        assert_eq!(m.sel, 0);
     }
 
     /// The header search glyph is `iconLarge` (18px), inline with the

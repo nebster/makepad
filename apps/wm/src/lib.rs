@@ -3509,8 +3509,27 @@ impl App {
         true
     }
 
+    /// Setup > Start at login: turn `id` on or off in the autostart file.
+    /// Whether it is on now is read from the file, not the menu's tick, so
+    /// a hand edit is respected. Nothing launches or closes now; the change
+    /// applies from the next WM start. A failure leaves the file as it was.
+    fn toggle_autostart(&mut self, cx: &mut Cx, id: &str) {
+        let path = autostart::path();
+        let result = autostart::read_text(&path)
+            .map(|text| !autostart::is_enabled(&text, id))
+            .and_then(|on| autostart::toggle(&path, id, on).map(|()| on));
+        match result {
+            Ok(on) => log!("wm: autostart: {id} {}", if on { "on" } else { "off" }),
+            Err(e) => {
+                log!("wm: autostart: could not save: {e}");
+                self.notify(cx, "Start at login", &format!("Could not save: {e}"));
+            }
+        }
+    }
+
     /// What a menu row does. The ids are the jsonc's dotted paths, with
-    /// `apps.<id>` and `style.theme[.import].<name>` from the providers.
+    /// `apps.<id>`, `style.theme[.import].<name>` and `setup.autostart.<id>`
+    /// from the providers.
     fn shell_menu_activate(&mut self, cx: &mut Cx, target: &str) {
         log!("wm: shell menu activate {target}");
         if target=="start.documents" {self.launch_app(cx,"files");return;}
@@ -3522,6 +3541,19 @@ impl App {
                 self.set_desktop_sheet(cx, entry);
                 return;
             }
+        }
+        if let Some(id) = shell::menu::autostart_target(target) {
+            self.toggle_autostart(cx, id);
+            // The menu closed before it emitted Activate: reopen it on the
+            // row just toggled, so the list stays up for the next one. The
+            // tick is read from the file again, so it shows the truth.
+            self.open_shell_menu(cx, shell::menu::AUTOSTART_MENU, MenuSkin::Menu);
+            let menu = self.ui.widget(cx, ids!(shell_menu));
+            if let Some(m) = menu.borrow_mut::<ShellMenu>().as_mut() {
+                m.select_target(cx, target);
+            }
+            self.redraw_all(cx);
+            return;
         }
         if let Some(app) = target.strip_prefix("apps.") {
             let app = app.to_string();
