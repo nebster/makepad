@@ -1,6 +1,7 @@
 //! Reusable graph-canvas widget and its display-only view model.
 
 pub mod canvas;
+pub mod frames;
 pub mod model;
 pub mod wire_route;
 
@@ -9,8 +10,9 @@ pub use canvas::{
     BoundaryLink, CanvasViewportError, EmbeddedCanvasRoot, FlowCanvas, FlowCanvasAction, NodeGeometry,
     NodeStatus, Selection, CANVAS_SCALE_MAX, CANVAS_SCALE_MIN, LOCAL_ORIGIN,
 };
+pub use frames::{Corner, FRAME_GRIP, FRAME_HEADER_H, MIN_FRAME};
 pub use model::{
-    CompatiblePorts, EdgeView, FacePort, FaceViewport, GraphIndex, GraphView, NodeFaces, NodeFacesScope, NodeStyle,
+    CompatiblePorts, EdgeView, FacePort, FrameView, FaceViewport, GraphIndex, GraphView, NodeFaces, NodeFacesScope, NodeStyle,
     NodeView, PortIconOverrides, PortStyle, PortView, WirePainter, FIRST_AT, NODE_WIDTH,
 };
 

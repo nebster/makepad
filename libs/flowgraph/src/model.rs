@@ -10,6 +10,19 @@ pub const FIRST_AT: (f64, f64) = (40.0, 120.0);
 pub struct GraphView {
     pub nodes: Vec<NodeView>,
     pub edges: Vec<EdgeView>,
+    /// Group frames, drawn behind every card in this order.
+    pub frames: Vec<FrameView>,
+}
+
+/// A group frame drawn behind the cards whose centres lie in it (a host's grouping: a role, a region). Frames never overlap each other.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FrameView {
+    pub id: String,
+    pub title: String,
+    pub at: (f64, f64),
+    pub size: (f64, f64),
+    /// Host style key, looked up like `NodeView::kind`; its colour tints the frame.
+    pub kind: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -28,6 +41,8 @@ pub struct NodeView {
     /// String-valued presentation parameters read by the canvas. At present
     /// this only lets an Output card advertise its selected port kind.
     pub params: Vec<(String, String)>,
+    /// The card's width while `size` is `None` (else `NODE_WIDTH`); the height is still measured from the face.
+    pub width: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -293,6 +308,8 @@ pub trait NodeFaces {
     fn draw_node_overlay(&mut self, _cx: &mut Cx2d, _node: &str, _viewport: &FaceViewport) {}
 
     fn draw_face(&mut self, cx: &mut Cx2d, node: &str, walk: Walk, card_sized: bool);
+    /// Draw the host's content of `frame`'s header in `walk` (the header band right of its left padding). Return true when drawn: the canvas then draws no title of its own.
+    fn draw_frame_header(&mut self, _cx: &mut Cx2d, _frame: &str, _walk: Walk) -> bool { false }
     /// Override to draw an independently transformed canvas inside a card.
     /// The default preserves ordinary face drawing. A nested scope must borrow
     /// its own face host; do not retain this callback or NodeFacesScope.

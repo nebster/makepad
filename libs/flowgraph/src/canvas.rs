@@ -27,6 +27,7 @@
 //! Embedded canvases and expanded zoom ranges rebase near the visible world
 //! before the f32 GPU conversion. Hosts still bound visible depth and node work.
 
+use crate::frames::{self, Corner, FRAME_GRIP, FRAME_HEADER_H, MIN_FRAME};
 use crate::model::{
     CanvasStyles, CompatiblePorts, FacePort, FaceViewport, GraphView as Graph, NodeFacesScope, NodeStyle,
     NodeView as Node, PortIconOverrides, PortStyle, NODE_WIDTH,
@@ -106,6 +107,10 @@ const AUTO_FLIP_MAX_PASSES: usize = 3;
 const CROSSING_COST: f64 = 400.0;
 const BEND_COST: f64 = 120.0;
 const LOOP_COST: f64 = 300.0;
+const FRAME_RADIUS: f32 = 22.0;
+const FRAME_BODY_ALPHA: f32 = 0.16;
+const FRAME_HEADER_ALPHA: f32 = 0.30;
+const FRAME_TITLE_PAD: f64 = 18.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct CardOutlineGeometry {
@@ -286,7 +291,8 @@ script_mod! {
                 self.sdf_rect_size.y,
                 self.border_radius
             )
-            if sdf.shape > -1.0 {
+            // The gaussian divides by the blur: a flat (frame) body has none.
+            if self.shadow_radius > 0.0 && sdf.shape > -1.0 {
                 let m = self.shadow_radius
                 let o = self.shadow_offset + self.rect_shift
                 let v = GaussShadow.rounded_box_shadow(
@@ -327,6 +333,10 @@ script_mod! {
             color_b: theme.flow_grid_b
         }
         draw_card +: {}
+        draw_frame +: {
+            shadow_radius: 0.0
+            shadow_color: #0000
+        }
         draw_title +: {
             text_style: theme.font_bold{font_size: 10.5}
             color: theme.flow_text
@@ -474,6 +484,18 @@ pub enum CanvasEdit {
         type_name: String,
         at: (f64, f64),
     },
+    /// A frame was dragged: its new origin and the new origins of the cards that moved with it.
+    MoveFrame {
+        frame: String,
+        at: (f64, f64),
+        cards: Vec<(String, (f64, f64))>,
+    },
+    /// A frame was resized from a corner: its new origin and size.
+    ResizeFrame {
+        frame: String,
+        at: (f64, f64),
+        size: (f64, f64),
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -488,13 +510,16 @@ pub enum Selection {
         /// wire even where two share their ends.
         key: Option<u64>,
     },
+    /// A group frame, by its `FrameView::id`.
+    Frame(String),
 }
 
 impl Selection {
+    /// The selected card; `None` for a wire or a frame.
     pub fn node(&self) -> Option<&str> {
         match self {
             Self::Node(node) => Some(node),
-            Self::Edge { .. } => None,
+            Self::Edge { .. } | Self::Frame(_) => None,
         }
     }
 }
@@ -557,6 +582,25 @@ enum Drag {
         /// Kept in the graph until release; Escape or a graph replacement
         /// cancels pickup without ever publishing a destructive edit.
         picked_up: Option<EdgeIndex>,
+    },
+    /// A frame's header or body pressed: the frame and the cards whose
+    /// centres lay in it at the press (`cards`: index and initial origin)
+    /// move together by `origin - initial`.
+    Frame {
+        index: usize,
+        start: DVec2,
+        initial: (f64, f64),
+        origin: (f64, f64),
+        cards: Vec<(usize, (f64, f64))>,
+        moved: bool,
+    },
+    /// A frame's corner pressed: `rect` is the clamped world rect so far.
+    FrameResize {
+        index: usize,
+        corner: Corner,
+        start: DVec2,
+        initial: Rect,
+        rect: Rect,
     },
 }
 
@@ -773,6 +817,9 @@ pub enum CanvasNodeRegion {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CanvasPick {
     Background,
+    /// A card, a boundary slot, or a group frame: a frame picks as a node of
+    /// its `FrameView::id` (Header for its header band, Resize on a corner
+    /// grip, Body elsewhere).
     Node {
         node: String,
         region: CanvasNodeRegion,
@@ -871,6 +918,18 @@ fn same_link(a: &BoundaryLink, b: &BoundaryLink) -> bool {
 
 fn finite_point(point: DVec2) -> bool {
     point.x.is_finite() && point.y.is_finite()
+}
+
+/// Where a point inside a frame's rect falls: a corner grip, the header
+/// band, or the body below it.
+fn frame_region(rect: Rect, point: DVec2, grip: f64) -> CanvasNodeRegion {
+    if frames::corner_at(rect, point, grip).is_some() {
+        CanvasNodeRegion::Resize
+    } else if point.y < rect.pos.y + FRAME_HEADER_H {
+        CanvasNodeRegion::Header
+    } else {
+        CanvasNodeRegion::Body
+    }
 }
 
 fn intersect_rect(a: Rect, b: Rect) -> Rect {
@@ -1010,6 +1069,9 @@ pub struct FlowCanvas {
     draw_bg: DrawFlowGrid,
     #[live]
     draw_card: DrawFlowCard,
+    /// Group frame bodies and header bands: the card shader without a shadow.
+    #[live]
+    draw_frame: DrawFlowCard,
     #[live]
     draw_vec: DrawVector,
     #[live]
@@ -1177,6 +1239,9 @@ pub struct FlowCanvas {
     hover: Option<usize>,
     #[rust]
     hover_wire: Option<usize>,
+    /// The frame under the pointer when no card or wire is: its grips show.
+    #[rust]
+    hover_frame: Option<usize>,
     #[rust]
     selected: Option<Selection>,
     #[rust]
@@ -1415,15 +1480,40 @@ impl FlowCanvas {
     pub fn update_graph_layout(&mut self, cx: &mut Cx, next: &Graph) -> bool {
         let Some(current) = self.graph.as_ref() else { return false; };
         if current.nodes.len() != next.nodes.len() { return false; }
+        if current.frames.len() != next.frames.len()
+            || current.frames.iter().zip(&next.frames).any(|(frame, next)| frame.id != next.id || frame.kind != next.kind)
+        {
+            return false;
+        }
         let mut projection = current.clone();
         for (node, next) in projection.nodes.iter_mut().zip(&next.nodes) {
             node.at = next.at;
             node.size = next.size;
             node.flip = next.flip;
         }
+        for (frame, next) in projection.frames.iter_mut().zip(&next.frames) {
+            frame.at = next.at;
+            frame.size = next.size;
+            frame.title = next.title.clone();
+        }
         if projection != *next { return false; }
         for node in &next.nodes {
             self.set_node_layout(cx, &node.id, node.at, node.size, node.flip);
+        }
+        for frame in &next.frames {
+            self.set_frame_layout(cx, &frame.id, frame.at, frame.size);
+        }
+        if let Some(graph) = self.graph.as_mut() {
+            let mut retitled = false;
+            for (frame, next) in graph.frames.iter_mut().zip(&next.frames) {
+                if frame.title != next.title {
+                    frame.title = next.title.clone();
+                    retitled = true;
+                }
+            }
+            if retitled {
+                self.redraw(cx);
+            }
         }
         true
     }
@@ -1733,6 +1823,13 @@ impl FlowCanvas {
         {
             return Some(CanvasPick::Wire(selection));
         }
+        if let Some(index) = self.frame_index_at(point) {
+            let world = self.interaction_camera().screen_to_world(point);
+            return Some(CanvasPick::Node {
+                node: graph.frames[index].id.clone(),
+                region: frame_region(self.frame_world_rect(graph, index), dvec2(world.0, world.1), self.frame_grip()),
+            });
+        }
         Some(CanvasPick::Background)
     }
     pub fn wire_mode(&self) -> WireMode {
@@ -1981,6 +2078,7 @@ impl FlowCanvas {
         }
         self.hover = None;
         self.hover_wire = None;
+        self.hover_frame = None;
         if let Some(selected) = self.selected.clone() {
             if !self.has_selection(&selected) {
                 self.selected = None;
@@ -2038,6 +2136,16 @@ impl FlowCanvas {
             self.selected = selection.clone();
             cx.widget_action(self.uid, FlowCanvasAction::Select(selection));
             self.redraw(cx);
+        }
+    }
+
+    /// Select frame `index`, announcing it when the selection changes.
+    fn select_frame(&mut self, cx: &mut Cx, index: usize) {
+        let Some(frame) = self.graph.as_ref().and_then(|graph| graph.frames.get(index)) else { return; };
+        let selection = Selection::Frame(frame.id.clone());
+        if self.selected.as_ref() != Some(&selection) {
+            self.selected = Some(selection.clone());
+            cx.widget_action(self.uid, FlowCanvasAction::Select(Some(selection)));
         }
     }
 
@@ -2290,6 +2398,10 @@ impl FlowCanvas {
     fn has_selection(&self, selection: &Selection) -> bool {
         match selection {
             Selection::Node(node) => self.has_node(node),
+            Selection::Frame(frame) => self
+                .graph
+                .as_ref()
+                .is_some_and(|graph| graph.frames.iter().any(|candidate| candidate.id == *frame)),
             Selection::Edge {
                 from_node,
                 from_port,
@@ -2325,6 +2437,11 @@ impl FlowCanvas {
                 at = *origin;
             }
         }
+        if let Some(Drag::Frame { cards, initial, origin, .. }) = &self.drag {
+            if let Some((_, card)) = cards.iter().find(|(card, _)| *card == index) {
+                at = (card.0 + origin.0 - initial.0, card.1 + origin.1 - initial.1);
+            }
+        }
         at
     }
 
@@ -2358,7 +2475,7 @@ impl FlowCanvas {
             .map(|(w, h)| clamp_card_size(dvec2(w, h), Self::full_bleed(node), Self::port_rows(node)))
             .unwrap_or_else(|| {
                 dvec2(
-                    NODE_WIDTH,
+                    node.width.unwrap_or(NODE_WIDTH),
                     self.heights
                         .get(index)
                         .copied()
@@ -2366,6 +2483,108 @@ impl FlowCanvas {
                         .max(min_height),
                 )
             })
+    }
+
+    /// A card's rect in world units, a live drag applied.
+    fn world_card_rect(&self, graph: &Graph, index: usize) -> Rect {
+        let at = self.node_at(graph, index);
+        Rect {
+            pos: dvec2(at.0, at.1),
+            size: self.node_size(graph, index),
+        }
+    }
+
+    /// A frame's rect in world units, with its live move or resize applied.
+    fn frame_world_rect(&self, graph: &Graph, index: usize) -> Rect {
+        match &self.drag {
+            Some(Drag::Frame { index: dragged, origin, .. }) if *dragged == index => {
+                let frame = &graph.frames[index];
+                Rect { pos: dvec2(origin.0, origin.1), size: dvec2(frame.size.0, frame.size.1) }
+            }
+            Some(Drag::FrameResize { index: resized, rect, .. }) if *resized == index => *rect,
+            _ => {
+                let frame = &graph.frames[index];
+                Rect { pos: dvec2(frame.at.0, frame.at.1), size: dvec2(frame.size.0, frame.size.1) }
+            }
+        }
+    }
+
+    /// A frame's rect in render-local units, as `card_rect` is.
+    fn frame_rect(&self, graph: &Graph, index: usize) -> Rect {
+        let world = self.frame_world_rect(graph, index);
+        Rect {
+            pos: self.camera.world_to_render((world.pos.x, world.pos.y)),
+            size: world.size,
+        }
+    }
+
+    /// The world rects of every frame but `index`, as stored: what a move or
+    /// resize of `index` must not overlap.
+    fn other_frame_rects(graph: &Graph, index: usize) -> Vec<Rect> {
+        graph
+            .frames
+            .iter()
+            .enumerate()
+            .filter(|(other, _)| *other != index)
+            .map(|(_, frame)| Rect { pos: dvec2(frame.at.0, frame.at.1), size: dvec2(frame.size.0, frame.size.1) })
+            .collect()
+    }
+
+    /// The style colour for a frame's `kind`, else the accent.
+    fn frame_tint(&self, kind: &str) -> Vec4f {
+        self.styles.node_color(kind).unwrap_or(self.accent_color)
+    }
+
+    /// The corner grip size in world units at the current zoom.
+    fn frame_grip(&self) -> f64 {
+        FRAME_GRIP / self.interaction_camera().scale.min(1.0)
+    }
+
+    /// The last (topmost) frame whose rect holds the window point `abs`.
+    fn frame_index_at(&self, abs: DVec2) -> Option<usize> {
+        let graph = self.graph.as_ref()?;
+        let world = self.interaction_camera().screen_to_world(abs);
+        let point = dvec2(world.0, world.1);
+        (0..graph.frames.len()).rev().find(|index| self.frame_world_rect(graph, *index).contains(point))
+    }
+
+    /// The frame and corner whose grip holds the window point `abs`.
+    fn frame_corner_at(&self, abs: DVec2) -> Option<(usize, Corner)> {
+        let graph = self.graph.as_ref()?;
+        let index = self.frame_index_at(abs)?;
+        let world = self.interaction_camera().screen_to_world(abs);
+        frames::corner_at(self.frame_world_rect(graph, index), dvec2(world.0, world.1), self.frame_grip())
+            .map(|corner| (index, corner))
+    }
+
+    /// Each frame's id and world rect, as drawn (a drag in progress included).
+    pub fn frame_rects(&self) -> Vec<(String, Rect)> {
+        let Some(graph) = self.graph.as_ref() else { return Vec::new(); };
+        graph
+            .frames
+            .iter()
+            .enumerate()
+            .map(|(index, frame)| (frame.id.clone(), self.frame_world_rect(graph, index)))
+            .collect()
+    }
+
+    /// The header band of `frame` in world units.
+    pub fn frame_header_rect(&self, frame: &str) -> Option<Rect> {
+        let graph = self.graph.as_ref()?;
+        let index = graph.frames.iter().position(|candidate| candidate.id == frame)?;
+        let rect = self.frame_world_rect(graph, index);
+        Some(Rect { pos: rect.pos, size: dvec2(rect.size.x, FRAME_HEADER_H.min(rect.size.y)) })
+    }
+
+    /// Refresh one existing frame's geometry without disturbing an ongoing
+    /// gesture, as `set_node_layout` does for a card.
+    pub fn set_frame_layout(&mut self, cx: &mut Cx, frame: &str, at: (f64, f64), size: (f64, f64)) {
+        let Some(graph) = self.graph.as_mut() else { return; };
+        let Some(frame) = graph.frames.iter_mut().find(|candidate| candidate.id == frame) else { return; };
+        if frame.at == at && frame.size == size { return; }
+        frame.at = at;
+        frame.size = size;
+        self.redraw(cx);
     }
 
     fn point_over_chrome(&self, abs: DVec2) -> bool {
@@ -3685,6 +3904,77 @@ impl FlowCanvas {
     }
 
     /// Card shadow, body and its shared-geometry selection/hover outline.
+    /// Group frames, in the main draw list beneath every card list: a tinted
+    /// body, a header band, corner grips when hovered or selected, and the
+    /// header content, which the host draws (else the frame's title).
+    fn draw_frames(&mut self, cx: &mut Cx2d, scope: &mut Scope, graph: &Graph) {
+        if graph.frames.is_empty() {
+            return;
+        }
+        let selected = match &self.selected {
+            Some(Selection::Frame(frame)) => Some(frame.as_str()),
+            _ => None,
+        };
+        let outline = (CARD_OUTLINE_PX / self.camera.scale.max(0.01)) as f32;
+        let alpha = |tint: Vec4f, alpha: f32| vec4(tint.x, tint.y, tint.z, tint.w * alpha);
+        for (index, frame) in graph.frames.iter().enumerate() {
+            let rect = self.frame_rect(graph, index);
+            let tint = self.frame_tint(&frame.kind);
+            let is_selected = selected == Some(frame.id.as_str());
+            self.draw_frame.color = alpha(tint, FRAME_BODY_ALPHA);
+            self.draw_frame.border_color = tint;
+            self.draw_frame.border_size = 1.5;
+            self.draw_frame.border_radius = FRAME_RADIUS;
+            self.draw_frame.outline_color = self.accent_color;
+            self.draw_frame.outline_size = if is_selected { outline } else { 0.0 };
+            self.draw_frame.draw_abs(cx, rect);
+            self.draw_frame.color = alpha(tint, FRAME_HEADER_ALPHA);
+            self.draw_frame.outline_size = 0.0;
+            self.draw_frame.draw_abs(
+                cx,
+                Rect { pos: rect.pos, size: dvec2(rect.size.x, FRAME_HEADER_H.min(rect.size.y)) },
+            );
+        }
+        let grip = self.frame_grip();
+        self.draw_vec.begin();
+        for (index, frame) in graph.frames.iter().enumerate() {
+            if self.hover_frame != Some(index) && selected != Some(frame.id.as_str()) {
+                continue;
+            }
+            let rect = self.frame_rect(graph, index);
+            let tint = self.frame_tint(&frame.kind);
+            Self::set_color(&mut self.draw_vec, tint, 0.9);
+            let size = (grip * 0.5) as f32;
+            let inset = grip * 0.25;
+            for (x, y) in [
+                (rect.pos.x + inset, rect.pos.y + inset),
+                (rect.pos.x + rect.size.x - inset - grip * 0.5, rect.pos.y + inset),
+                (rect.pos.x + inset, rect.pos.y + rect.size.y - inset - grip * 0.5),
+                (rect.pos.x + rect.size.x - inset - grip * 0.5, rect.pos.y + rect.size.y - inset - grip * 0.5),
+            ] {
+                self.draw_vec.rounded_rect(x as f32, y as f32, size, size, size * 0.25);
+                self.draw_vec.fill();
+            }
+        }
+        self.draw_vec.end(cx);
+        for (index, frame) in graph.frames.iter().enumerate() {
+            let rect = self.frame_rect(graph, index);
+            let header = Rect {
+                pos: rect.pos + dvec2(FRAME_TITLE_PAD, 8.0),
+                size: dvec2((rect.size.x - 2.0 * FRAME_TITLE_PAD).max(0.0), FRAME_HEADER_H - 16.0),
+            };
+            cx.push_clip_rect(header);
+            let drawn = scope
+                .data
+                .get_mut::<NodeFacesScope>()
+                .is_some_and(|faces| faces.faces().draw_frame_header(cx, &frame.id, Walk::abs_rect(header)));
+            if !drawn {
+                self.draw_title.draw_abs(cx, rect.pos + dvec2(FRAME_TITLE_PAD, 18.0), &frame.title);
+            }
+            cx.pop_clip_rect();
+        }
+    }
+
     fn draw_card(&mut self, cx: &mut Cx2d, graph: &Graph, indices: &[usize]) {
         self.draw_card.shadow_radius = (12.0 / self.camera.scale.max(0.01)) as f32;
         self.draw_card.shadow_offset = vec2(0.0, 0.0);
@@ -4313,6 +4603,17 @@ mod tests {
     }
 
     #[test]
+    fn a_frame_point_is_its_header_body_or_a_corner() {
+        let rect = Rect { pos: dvec2(100.0, 100.0), size: dvec2(400.0, 300.0) };
+        assert_eq!(frame_region(rect, dvec2(250.0, 110.0), FRAME_GRIP), CanvasNodeRegion::Header);
+        assert_eq!(frame_region(rect, dvec2(250.0, 155.0), FRAME_GRIP), CanvasNodeRegion::Header);
+        assert_eq!(frame_region(rect, dvec2(250.0, 156.0), FRAME_GRIP), CanvasNodeRegion::Body);
+        assert_eq!(frame_region(rect, dvec2(250.0, 390.0), FRAME_GRIP), CanvasNodeRegion::Body);
+        assert_eq!(frame_region(rect, dvec2(105.0, 105.0), FRAME_GRIP), CanvasNodeRegion::Resize);
+        assert_eq!(frame_region(rect, dvec2(495.0, 395.0), FRAME_GRIP), CanvasNodeRegion::Resize);
+    }
+
+    #[test]
     fn card_hit_wins_over_wire_hit() {
         assert_eq!(prioritize_canvas_hit(Some(3), Some(7)), CanvasHit::Card(3));
         assert_eq!(prioritize_canvas_hit(None, Some(7)), CanvasHit::Wire(7));
@@ -4615,6 +4916,7 @@ impl FlowCanvas {
         let mut measured_heights = Vec::new();
         if nonempty(viewport.clip) {
             if let Some(mut graph) = self.graph.take() {
+                self.draw_frames(cx, scope, &graph);
                 self.draw_boundaries(cx, &graph);
                 self.draw_wires(cx, scope, &graph);
                 let z_order = std::mem::take(&mut self.z_order);
@@ -4819,7 +5121,9 @@ impl FlowCanvas {
                 }
             }
         }
-        if !policy.pointer && (self.hover.take().is_some() | self.hover_wire.take().is_some()) {
+        if !policy.pointer
+            && (self.hover.take().is_some() | self.hover_wire.take().is_some() | self.hover_frame.take().is_some())
+        {
             self.area.redraw(cx);
         }
         if policy.pointer {
@@ -4842,6 +5146,17 @@ impl FlowCanvas {
                     };
                     let boundary_hover = hover.is_none() && self.contains_point(e.abs)
                         && !over_chrome && self.boundary_at(e.abs).is_some();
+                    let hover_frame = if matches!(hit, CanvasHit::Empty) && !boundary_hover
+                        && self.contains_point(e.abs) && !over_chrome
+                    {
+                        self.frame_index_at(e.abs)
+                    } else {
+                        None
+                    };
+                    if hover_frame != self.hover_frame {
+                        self.hover_frame = hover_frame;
+                        self.area.redraw(cx);
+                    }
                     cx.set_cursor(if hover_wire.is_some() || boundary_hover {
                         MouseCursor::Hand
                     } else {
@@ -5028,6 +5343,37 @@ impl FlowCanvas {
                         self.hover_wire = Some(index);
                         cx.set_cursor(MouseCursor::Hand);
                     }
+                } else if let Some((index, corner)) = self.frame_corner_at(fd.abs) {
+                    self.select_frame(cx, index);
+                    let graph = self.graph.as_ref().unwrap();
+                    let rect = self.frame_world_rect(graph, index);
+                    self.drag = Some(Drag::FrameResize {
+                        index,
+                        corner,
+                        start: fd.abs,
+                        initial: rect,
+                        rect,
+                    });
+                } else if let Some(index) = self.frame_index_at(fd.abs) {
+                    self.select_frame(cx, index);
+                    let graph = self.graph.as_ref().unwrap();
+                    let frame = self.frame_world_rect(graph, index);
+                    // The cards that move with the frame are those it holds
+                    // at the press; a card dragged out later stays behind.
+                    let cards = (0..graph.nodes.len())
+                        .filter(|card| !self.is_boundary(graph, *card))
+                        .filter(|card| frames::holds(frame, self.world_card_rect(graph, *card)))
+                        .map(|card| (card, graph.nodes[card].at))
+                        .collect();
+                    let initial = (frame.pos.x, frame.pos.y);
+                    self.drag = Some(Drag::Frame {
+                        index,
+                        start: fd.abs,
+                        initial,
+                        origin: initial,
+                        cards,
+                        moved: false,
+                    });
                 } else {
                     self.drag = Some(Drag::Pan {
                         start: fd.abs,
@@ -5106,6 +5452,57 @@ impl FlowCanvas {
                             ),
                         });
                         self.wire_cache_dirty = true;
+                    }
+                    Some(Drag::Frame {
+                        index,
+                        start,
+                        initial,
+                        origin,
+                        cards,
+                        moved,
+                    }) => {
+                        let moved = moved || (fm.abs - start).length() > DRAG_THRESHOLD;
+                        let origin = match self.graph.as_ref().filter(|_| moved) {
+                            Some(graph) => {
+                                let frame = &graph.frames[index];
+                                let rect = Rect {
+                                    pos: dvec2(initial.0, initial.1),
+                                    size: dvec2(frame.size.0, frame.size.1),
+                                };
+                                let others = Self::other_frame_rects(graph, index);
+                                let delta = frames::clamp_move(rect, (fm.abs - start) / s, &others);
+                                (initial.0 + delta.x, initial.1 + delta.y)
+                            }
+                            None => origin,
+                        };
+                        self.drag = Some(Drag::Frame {
+                            index,
+                            start,
+                            initial,
+                            origin,
+                            cards,
+                            moved,
+                        });
+                        self.wire_cache_dirty = true;
+                    }
+                    Some(Drag::FrameResize {
+                        index,
+                        corner,
+                        start,
+                        initial,
+                        ..
+                    }) => {
+                        if let Some(graph) = self.graph.as_ref() {
+                            let others = Self::other_frame_rects(graph, index);
+                            let rect = frames::clamp_resize(initial, corner, (fm.abs - start) / s, MIN_FRAME, &others);
+                            self.drag = Some(Drag::FrameResize {
+                                index,
+                                corner,
+                                start,
+                                initial,
+                                rect,
+                            });
+                        }
                     }
                     Some(Drag::Wire {
                         from,
@@ -5190,6 +5587,55 @@ impl FlowCanvas {
                             );
                         }
                     }
+                    Some(Drag::Frame {
+                        index,
+                        initial,
+                        origin,
+                        cards,
+                        moved: true,
+                        ..
+                    }) => {
+                        if let Some(graph) = self.graph.as_mut() {
+                            let shift = (origin.0 - initial.0, origin.1 - initial.1);
+                            let mut moved_cards = Vec::with_capacity(cards.len());
+                            for (card, at) in cards {
+                                let Some(node) = graph.nodes.get_mut(card) else { continue; };
+                                node.at = (at.0 + shift.0, at.1 + shift.1);
+                                moved_cards.push((node.id.clone(), node.at));
+                            }
+                            if let Some(frame) = graph.frames.get_mut(index) {
+                                frame.at = origin;
+                                self.wire_cache_dirty = true;
+                                cx.widget_action(
+                                    self.uid,
+                                    FlowCanvasAction::Edit(CanvasEdit::MoveFrame {
+                                        frame: frame.id.clone(),
+                                        at: origin,
+                                        cards: moved_cards,
+                                    }),
+                                );
+                            }
+                        }
+                    }
+                    Some(Drag::Frame { .. }) => {}
+                    Some(Drag::FrameResize { index, rect, .. }) => {
+                        if let Some(frame) = self.graph.as_mut().and_then(|graph| graph.frames.get_mut(index)) {
+                            let at = (rect.pos.x, rect.pos.y);
+                            let size = (rect.size.x, rect.size.y);
+                            if frame.at != at || frame.size != size {
+                                frame.at = at;
+                                frame.size = size;
+                                cx.widget_action(
+                                    self.uid,
+                                    FlowCanvasAction::Edit(CanvasEdit::ResizeFrame {
+                                        frame: frame.id.clone(),
+                                        at,
+                                        size,
+                                    }),
+                                );
+                            }
+                        }
+                    }
                     Some(Drag::Wire {
                         from,
                         from_port,
@@ -5235,20 +5681,23 @@ impl FlowCanvas {
             }
             Hit::KeyDown(ke) if policy.keyboard => match ke.key_code {
                 KeyCode::Delete | KeyCode::Backspace => {
-                    if let Some(selection) = self.selected.take() {
-                        let edit = match selection {
-                            Selection::Node(node) => CanvasEdit::Delete { node },
-                            Selection::Edge {
-                                to_node,
-                                to_port,
-                                key,
-                                ..
-                            } => CanvasEdit::Disconnect {
-                                to_node,
-                                to_port,
-                                key,
-                            },
-                        };
+                    // A frame belongs to its host, which deletes it its own way.
+                    let edit = match self.selected.clone() {
+                        Some(Selection::Node(node)) => Some(CanvasEdit::Delete { node }),
+                        Some(Selection::Edge {
+                            to_node,
+                            to_port,
+                            key,
+                            ..
+                        }) => Some(CanvasEdit::Disconnect {
+                            to_node,
+                            to_port,
+                            key,
+                        }),
+                        Some(Selection::Frame(_)) | None => None,
+                    };
+                    if let Some(edit) = edit {
+                        self.selected = None;
                         cx.widget_action(self.uid, FlowCanvasAction::Edit(edit));
                         cx.widget_action(self.uid, FlowCanvasAction::Select(None));
                         self.area.redraw(cx);
