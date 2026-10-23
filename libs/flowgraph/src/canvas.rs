@@ -3903,7 +3903,6 @@ impl FlowCanvas {
         self.draw_vec.end(cx);
     }
 
-    /// Card shadow, body and its shared-geometry selection/hover outline.
     /// Group frames, in the main draw list beneath every card list: a tinted
     /// body, a header band, corner grips when hovered or selected, and the
     /// header content, which the host draws (else the frame's title).
@@ -3975,6 +3974,7 @@ impl FlowCanvas {
         }
     }
 
+    /// Card shadow, body and its shared-geometry selection/hover outline.
     fn draw_card(&mut self, cx: &mut Cx2d, graph: &Graph, indices: &[usize]) {
         self.draw_card.shadow_radius = (12.0 / self.camera.scale.max(0.01)) as f32;
         self.draw_card.shadow_offset = vec2(0.0, 0.0);
@@ -4589,9 +4589,30 @@ impl FlowCanvas {
     }
 }
 
+/// Whether a card at `card` (world rect) moves with a dragged frame at
+/// `frame`: a card that joins frames (`NodeView::joins_frames`), is not a
+/// boundary node, and has its centre in the frame (`frames::holds`).
+fn rides_with_frame(node: &Node, boundary: bool, frame: Rect, card: Rect) -> bool {
+    node.joins_frames && !boundary && frames::holds(frame, card)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_joining_cards_inside_ride_with_a_dragged_frame() {
+        let frame = Rect { pos: dvec2(0.0, 0.0), size: dvec2(400.0, 300.0) };
+        let inside = Rect { pos: dvec2(40.0, 80.0), size: dvec2(200.0, 100.0) };
+        let outside = Rect { pos: dvec2(500.0, 80.0), size: dvec2(200.0, 100.0) };
+        let joining = Node::default();
+        assert!(joining.joins_frames, "cards join frames by default");
+        let passing = Node { joins_frames: false, ..Node::default() };
+        assert!(rides_with_frame(&joining, false, frame, inside));
+        assert!(!rides_with_frame(&joining, false, frame, outside));
+        assert!(!rides_with_frame(&joining, true, frame, inside), "a boundary node stays");
+        assert!(!rides_with_frame(&passing, false, frame, inside), "a card that passes over frames stays");
+    }
 
     #[test]
     fn card_selection_moves_the_whole_retained_card_to_the_front() {
@@ -5361,8 +5382,9 @@ impl FlowCanvas {
                     // The cards that move with the frame are those it holds
                     // at the press; a card dragged out later stays behind.
                     let cards = (0..graph.nodes.len())
-                        .filter(|card| !self.is_boundary(graph, *card))
-                        .filter(|card| frames::holds(frame, self.world_card_rect(graph, *card)))
+                        .filter(|card| {
+                            rides_with_frame(&graph.nodes[*card], self.is_boundary(graph, *card), frame, self.world_card_rect(graph, *card))
+                        })
                         .map(|card| (card, graph.nodes[card].at))
                         .collect();
                     let initial = (frame.pos.x, frame.pos.y);
