@@ -25,7 +25,7 @@ pub struct FrameView {
     pub kind: String,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct NodeView {
     pub id: String,
     pub title: String,
@@ -43,6 +43,31 @@ pub struct NodeView {
     pub params: Vec<(String, String)>,
     /// The card's width while `size` is `None` (else `NODE_WIDTH`); the height is still measured from the face.
     pub width: Option<f64>,
+    /// Whether the card belongs to the group frame its centre lies in, and
+    /// so moves with that frame when the frame is dragged (true, the
+    /// default). A host whose grouping takes only some kinds sets false on
+    /// the others: they pass over frames and stay put when one moves.
+    pub joins_frames: bool,
+}
+
+impl Default for NodeView {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            title: String::new(),
+            type_name: String::new(),
+            kind: String::new(),
+            at: (0.0, 0.0),
+            size: None,
+            flip: false,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            full_bleed: false,
+            params: Vec::new(),
+            width: None,
+            joins_frames: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
