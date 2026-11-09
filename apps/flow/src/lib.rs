@@ -1740,6 +1740,7 @@ impl App {
             Some(Selection::Node(local)) => format!("{}{local}", hierarchy::prefix(&path)) == node,
             Some(Selection::Edge { from_node, from_port, .. }) =>
                 self.wire_source_key_at(&path, graph.as_ref(), &from_node, &from_port).0 == node,
+            Some(Selection::Frame(_)) => false,
             None => false,
         }
     }
@@ -3341,6 +3342,7 @@ impl App {
                 };
                 graph_edit::add_node(&graph, entry, at).0
             }
+            CanvasEdit::MoveFrame { .. } | CanvasEdit::ResizeFrame { .. } => return,
         };
         self.put_graph_with(cx, next, layout_only);
     }
@@ -6110,7 +6112,7 @@ impl App {
                     Some(Selection::Edge {
                         to_node, to_port, key, ..
                     }) => Some(CanvasEdit::Disconnect { to_node, to_port, key }),
-                    None => None,
+                    Some(Selection::Frame(_)) | None => None,
                 };
                 if let Some(edit) = edit {
                     if let Some(mut canvas) = self.ui.widget(cx, ids!(canvas)).borrow_mut::<FlowCanvas>() {

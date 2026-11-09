@@ -121,6 +121,7 @@ pub fn view_of(graph: &Graph) -> GraphView {
                         _ => None,
                     })
                     .collect(),
+                ..Default::default()
             })
             .collect(),
         edges: graph
@@ -134,6 +135,7 @@ pub fn view_of(graph: &Graph) -> GraphView {
                 key: edge.conn,
             })
             .collect(),
+        frames: Vec::new(),
     }
 }
 
