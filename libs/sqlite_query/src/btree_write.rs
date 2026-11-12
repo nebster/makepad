@@ -23,6 +23,7 @@ use crate::value::{
     be_u32, compare_records, parse_record, read_varint, write_varint, Collation, TextMode, Value,
 };
 use std::cmp::Ordering;
+use std::ops::Range;
 
 /// Header byte offsets used by the freelist.
 const HDR_FREELIST_TRUNK: usize = 32;
@@ -942,7 +943,8 @@ impl<'p> BtreeWriter<'p> {
         Ok(())
     }
 
-    /// Split one page into two and push a separator into its parent.
+    /// Split one page into two (or, when a large cell leaves no two halves
+    /// that fit, more) and push a separator per new page into its parent.
     fn split(
         &mut self,
         path: &[(u32, usize)],
@@ -956,134 +958,92 @@ impl<'p> BtreeWriter<'p> {
         if cells.len() < 2 {
             return Err(Error::corrupt("a single cell does not fit on a page"));
         }
-
-        // Halve by byte weight so both sides fit.
-        let total: usize = cells.iter().map(|c| c.bytes.len() + 2).sum();
-        let mut acc = 0usize;
-        let mut split_at = 0usize;
-        for (i, c) in cells.iter().enumerate() {
-            acc += c.bytes.len() + 2;
-            if acc * 2 >= total {
-                split_at = i + 1;
-                break;
-            }
-        }
-        split_at = split_at.clamp(1, cells.len() - 1);
-
         let is_index = matches!(page_type, PageType::IndexLeaf | PageType::IndexInterior);
-        let mut left: Vec<Cell> = cells[..split_at].to_vec();
-        let right: Vec<Cell> = cells[split_at..].to_vec();
-        // For an index split the median moves up instead of staying put.
-        let median = if is_index { left.pop() } else { None };
-        if left.is_empty() {
-            return Err(Error::corrupt("index split left no cells behind"));
+        let groups = split_groups(pgno, page_type, &cells, usable)
+            .ok_or_else(|| Error::corrupt("a split has no way to place its cells"))?;
+
+        // Each group but the last gives up its last cell as the separator
+        // that goes up: on a table interior page its child becomes the
+        // group's rightmost and its rowid the key; on an index page it is the
+        // median, which moves up rather than staying put. A table leaf keeps
+        // all its cells and is keyed by its last rowid.
+        struct Part {
+            cells: Vec<Cell>,
+            right: Option<u32>,
+            sep: Option<Cell>,
+            key: i64,
+        }
+        let mut parts: Vec<Part> = Vec::with_capacity(groups.len());
+        for (g, range) in groups.iter().enumerate() {
+            let last = g + 1 == groups.len();
+            let mut group: Vec<Cell> = cells[range.clone()].to_vec();
+            let sep = if !last && page_type != PageType::TableLeaf { group.pop() } else { None };
+            if group.is_empty() {
+                return Err(Error::corrupt("a split left a page with no cells"));
+            }
+            let (right, key) = match (page_type, &sep) {
+                (_, None) if last => (right_child, 0),
+                (PageType::TableLeaf, _) => (None, group.last().map(|c| c.rowid).unwrap_or(0)),
+                (PageType::TableInterior, Some(sep)) => (Some(be_u32(&sep.bytes, 0)?), sep.rowid),
+                (PageType::IndexInterior, Some(med)) => (Some(be_u32(&med.bytes, 0)?), 0),
+                (PageType::IndexLeaf, Some(_)) => (None, 0),
+                _ => return Err(Error::corrupt("a split group has no separator")),
+            };
+            parts.push(Part { cells: group, right, sep, key });
         }
 
-        // The new page always takes the right half, so page numbers of existing
-        // pages (and therefore sqlite_master) never change.
-        let new_pgno = self.allocate_page()?;
-        let (left_right_child, right_right_child) = match page_type {
-            PageType::TableInterior => {
-                // The last left cell's child becomes the left page's rightmost.
-                let last = left.pop().ok_or_else(|| Error::corrupt("empty split"))?;
-                let child = be_u32(&last.bytes, 0)?;
-                let sep_key = last.rowid;
-                let _ = sep_key;
-                (Some(child), right_child)
-            }
-            PageType::IndexInterior => {
-                let med = median.as_ref().ok_or_else(|| Error::corrupt("no median"))?;
-                (Some(be_u32(&med.bytes, 0)?), right_child)
-            }
-            _ => (None, None),
-        };
-        let left_last_key = match page_type {
-            PageType::TableInterior => {
-                // After moving the last cell up, the separator is its rowid.
-                cells[split_at - 1].rowid
-            }
-            PageType::TableLeaf => left.last().map(|c| c.rowid).unwrap_or(0),
-            _ => 0,
-        };
+        // The first group keeps the page (or, for the root, moves to a fresh
+        // one so the root's page number stays valid); every other group takes
+        // a new page, so page numbers of existing pages (and therefore
+        // sqlite_master) never change.
+        let is_root = path.len() == 1;
+        let mut pages: Vec<u32> = Vec::with_capacity(parts.len());
+        for g in 0..parts.len() {
+            pages.push(if g == 0 && !is_root { pgno } else { self.allocate_page()? });
+        }
+        for (part, &no) in parts.iter().zip(&pages) {
+            let header = if no == 1 { Some(self.header()?) } else { None };
+            let page = serialize_page(no, page_type, &part.cells, part.right, page_size, usable, header.as_deref())
+                .ok_or_else(|| Error::corrupt("a split page does not fit"))?;
+            self.pager.write_page(no, &page)?;
+        }
 
-        let header = if pgno == 1 { Some(self.header()?) } else { None };
-        let left_page = serialize_page(
-            pgno,
-            page_type,
-            &left,
-            left_right_child,
-            page_size,
-            usable,
-            header.as_deref(),
-        )
-        .ok_or_else(|| Error::corrupt("left half of a split does not fit"))?;
-        let right_page = serialize_page(
-            new_pgno,
-            page_type,
-            &right,
-            right_right_child,
-            page_size,
-            usable,
-            None,
-        )
-        .ok_or_else(|| Error::corrupt("right half of a split does not fit"))?;
+        // One separator per page but the last, pointing at that page.
+        let mut seps: Vec<Cell> = Vec::with_capacity(parts.len() - 1);
+        for (part, &no) in parts.iter().zip(&pages).take(parts.len() - 1) {
+            seps.push(if is_index {
+                let med = part.sep.as_ref().ok_or_else(|| Error::corrupt("no median for an index split"))?;
+                Cell {
+                    bytes: index_cell_with_child(&med.bytes, page_type, usable, no)?,
+                    rowid: 0,
+                }
+            } else {
+                let mut cell = Vec::with_capacity(12);
+                cell.extend_from_slice(&no.to_be_bytes());
+                write_varint(&mut cell, part.key as u64);
+                Cell {
+                    bytes: cell,
+                    rowid: part.key,
+                }
+            });
+        }
+        let last_page = *pages.last().expect("a split makes pages");
 
-        if path.len() == 1 {
-            // Splitting the root: its content moves to a fresh page so the root
-            // page number stays valid, and the root becomes an interior page.
-            let moved = self.allocate_page()?;
-            let moved_page = serialize_page(
-                moved,
-                page_type,
-                &left,
-                left_right_child,
-                page_size,
-                usable,
-                None,
-            )
-            .ok_or_else(|| Error::corrupt("moved root half does not fit"))?;
-            self.pager.write_page(moved, &moved_page)?;
-            self.pager.write_page(new_pgno, &right_page)?;
-
+        if is_root {
+            // The root becomes an interior page over the groups.
             let root_type = if is_index {
                 PageType::IndexInterior
             } else {
                 PageType::TableInterior
             };
-            let sep_cell = if is_index {
-                let med = median.ok_or_else(|| Error::corrupt("no median for an index split"))?;
-                Cell {
-                    bytes: index_cell_with_child(&med.bytes, page_type, usable, moved)?,
-                    rowid: 0,
-                }
-            } else {
-                let mut cell = Vec::with_capacity(12);
-                cell.extend_from_slice(&moved.to_be_bytes());
-                write_varint(&mut cell, left_last_key as u64);
-                Cell {
-                    bytes: cell,
-                    rowid: left_last_key,
-                }
-            };
             let header = if pgno == 1 { Some(self.header()?) } else { None };
-            let root_page = serialize_page(
-                pgno,
-                root_type,
-                &[sep_cell],
-                Some(new_pgno),
-                page_size,
-                usable,
-                header.as_deref(),
-            )
-            .ok_or_else(|| Error::corrupt("new root does not fit"))?;
+            let root_page = serialize_page(pgno, root_type, &seps, Some(last_page), page_size, usable, header.as_deref())
+                .ok_or_else(|| Error::corrupt("new root does not fit"))?;
             self.pager.write_page(pgno, &root_page)?;
             return Ok(());
         }
 
-        self.pager.write_page(pgno, &left_page)?;
-        self.pager.write_page(new_pgno, &right_page)?;
-
-        // Insert the separator into the parent, which may split in turn.
+        // Insert the separators into the parent, which may split in turn.
         let parent_path = &path[..path.len() - 1];
         let (parent_no, child_index) = path[path.len() - 2];
         let parent = BtreePage::load(self.pager, parent_no)?;
@@ -1091,36 +1051,67 @@ impl<'p> BtreeWriter<'p> {
         let parent_type = parent.page_type;
         let mut parent_right = parent.right_child;
 
-        let sep_cell = if is_index {
-            let med = median.ok_or_else(|| Error::corrupt("no median for an index split"))?;
-            Cell {
-                bytes: index_cell_with_child(&med.bytes, page_type, usable, pgno)?,
-                rowid: 0,
-            }
-        } else {
-            let mut cell = Vec::with_capacity(12);
-            cell.extend_from_slice(&pgno.to_be_bytes());
-            write_varint(&mut cell, left_last_key as u64);
-            Cell {
-                bytes: cell,
-                rowid: left_last_key,
-            }
-        };
-
-        // The old page's pointer in the parent now points at the right half.
-        let at = child_index.min(parent_cells.len());
+        // The old page's pointer in the parent now points at the last group.
         if child_index == usize::MAX || child_index >= parent_cells.len() {
-            parent_right = Some(new_pgno);
-            parent_cells.push(sep_cell);
+            parent_right = Some(last_page);
+            parent_cells.extend(seps);
         } else {
+            let at = child_index;
             let mut updated = parent_cells[at].bytes.clone();
-            updated[0..4].copy_from_slice(&new_pgno.to_be_bytes());
+            updated[0..4].copy_from_slice(&last_page.to_be_bytes());
             parent_cells[at] = Cell {
                 bytes: updated,
                 rowid: parent_cells[at].rowid,
             };
-            parent_cells.insert(at, sep_cell);
+            parent_cells.splice(at..at, seps);
         }
         self.store_cells(parent_path, parent_type, parent_cells, parent_right)
+    }
+}
+
+/// How a split groups `cells` (of a page `pgno` of `page_type`) into pages:
+/// ranges in order, every one fitting once a non-last group has given up its
+/// last cell as the separator (`BtreeWriter::split`). Halves of equal byte
+/// weight when both fit; else the two-way split nearest to even that fits
+/// (a large cell in the middle can tip the even halves over); else, when a
+/// large cell between two others leaves no two halves that fit, as few
+/// pages as packing in order gives. `None` when some cell fits nowhere.
+fn split_groups(pgno: u32, page_type: PageType, cells: &[Cell], usable: usize) -> Option<Vec<Range<usize>>> {
+    let n = cells.len();
+    // The first group may keep page 1, with its file header; the rest are new.
+    let fits = |range: Range<usize>, first: bool, last: bool| {
+        let end = if !last && page_type != PageType::TableLeaf { range.end - 1 } else { range.end };
+        end > range.start && cells_fit(if first { pgno } else { 0 }, page_type, &cells[range.start..end], usable)
+    };
+    let weight = |range: Range<usize>| cells[range].iter().map(|c| c.bytes.len() + 2).sum::<usize>();
+
+    let total = weight(0..n);
+    let mut acc = 0usize;
+    let mut even = n - 1;
+    for (i, c) in cells.iter().enumerate() {
+        acc += c.bytes.len() + 2;
+        if acc * 2 >= total {
+            even = i + 1;
+            break;
+        }
+    }
+    let even = even.clamp(1, n - 1);
+    let two = |at: usize| fits(0..at, true, false) && fits(at..n, false, true);
+    if two(even) {
+        return Some(vec![0..even, even..n]);
+    }
+    if let Some(at) = (1..n).filter(|&at| two(at)).min_by_key(|&at| weight(0..at).abs_diff(weight(at..n))) {
+        return Some(vec![0..at, at..n]);
+    }
+    let mut groups = Vec::new();
+    let mut start = 0;
+    loop {
+        if fits(start..n, groups.is_empty(), true) {
+            groups.push(start..n);
+            return Some(groups);
+        }
+        let end = (start + 1..n).rev().find(|&end| fits(start..end, groups.is_empty(), false))?;
+        groups.push(start..end);
+        start = end;
     }
 }
