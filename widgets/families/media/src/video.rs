@@ -920,6 +920,32 @@ enum PlaybackState {
     CleaningUp,
 }
 
+/// A decoding error for the video playing as `*id`: playback goes back to
+/// `Unprepared` under the fresh id `fresh`, and the answer is the failed
+/// player the platform should release -- none when
+/// `stop_and_cleanup_resources` already asked for that (`CleaningUp`).
+///
+/// The platform keeps a player whose stream failed (and polls it every
+/// frame) until it is told to clean it up, so the error must ask. The fresh
+/// id keeps a retry apart from that release: `VideoPlaybackResourcesReleased`
+/// and anything else the failed player still had queued name the old id, so
+/// they can neither reset a retry that is already preparing nor make it
+/// wait, and the widget reads as unprepared from the error on. Releasing an
+/// id the platform never registered (a prepare that failed at once) is a
+/// no-op on every platform.
+fn fail_playback(state: &mut PlaybackState, id: &mut LiveId, fresh: LiveId) -> Option<LiveId> {
+    let release = (*state != PlaybackState::CleaningUp).then_some(*id);
+    *state = PlaybackState::Unprepared;
+    *id = fresh;
+    release
+}
+
+/// Whether `stop_and_cleanup_resources` asks the platform to release the
+/// player: only while one is held and no release is already on its way.
+fn stop_releases(state: &PlaybackState) -> bool {
+    *state != PlaybackState::Unprepared && *state != PlaybackState::CleaningUp
+}
+
 #[derive(Default, PartialEq, Debug)]
 enum AudioState {
     #[default]
@@ -1618,12 +1644,18 @@ impl Video {
                     "Error decoding video with id {} : {}",
                     self.id.0, event.error
                 );
-                // Recover from a failed prepare/playback attempt so callers can retry.
-                self.playback_state = PlaybackState::Unprepared;
+                // Recover from a failed prepare/playback attempt so callers can
+                // retry: release the failed player and retry under a fresh id.
+                let failed = self.id;
+                if let Some(release) =
+                    fail_playback(&mut self.playback_state, &mut self.id, LiveId::unique())
+                {
+                    cx.cleanup_video_playback_resources(release);
+                }
                 self.should_prepare_playback = false;
                 self.last_error = Some(event.error.clone());
                 if self.native_preview_attached {
-                    cx.detach_camera_native_preview(self.id);
+                    cx.detach_camera_native_preview(failed);
                     self.native_preview_attached = false;
                 }
                 self.redraw(cx);
@@ -1697,9 +1729,7 @@ impl Video {
     }
 
     fn stop_and_cleanup_resources(&mut self, cx: &mut Cx) {
-        if self.playback_state != PlaybackState::Unprepared
-            && self.playback_state != PlaybackState::CleaningUp
-        {
+        if stop_releases(&self.playback_state) {
             cx.cleanup_video_playback_resources(self.id);
             if self.native_preview_attached {
                 cx.detach_camera_native_preview(self.id);
@@ -2204,4 +2234,52 @@ pub enum VideoDataSource {
     Filesystem { path: String },
     #[live {input_id: LiveId::empty(), format_id: LiveId::empty()}]
     Camera { input_id: LiveId, format_id: LiveId },
+}
+
+#[cfg(test)]
+mod playback_tests {
+    use super::*;
+
+    /// An error for this video releases the failed player exactly once,
+    /// leaves the widget unprepared (so `begin_playback` prepares again at
+    /// once), and moves it to a fresh id, so the failed player's release and
+    /// anything else it still had queued cannot reach the retry.
+    #[test]
+    fn an_error_releases_the_failed_player_once_and_the_widget_can_play_again() {
+        let failed = LiveId(1);
+        let fresh = LiveId(2);
+        for under_way in [
+            PlaybackState::Preparing,
+            PlaybackState::Prepared,
+            PlaybackState::Playing,
+            PlaybackState::Paused,
+            PlaybackState::Completed,
+        ] {
+            let (mut state, mut id) = (under_way, failed);
+            assert_eq!(fail_playback(&mut state, &mut id, fresh), Some(failed), "the failed player is released");
+            assert_eq!(state, PlaybackState::Unprepared, "begin_playback prepares from here");
+            assert_eq!(id, fresh, "a retry runs under a new id");
+            assert_ne!(id, failed, "the failed player's VideoPlaybackResourcesReleased names another video");
+            assert!(!stop_releases(&state), "stop_and_cleanup_resources after the error asks for no second release");
+        }
+    }
+
+    /// An error that arrives after `stop_and_cleanup_resources` asked for the
+    /// release does not ask again, and still leaves the widget retryable.
+    #[test]
+    fn an_error_while_cleaning_up_asks_for_no_second_release() {
+        let (mut state, mut id) = (PlaybackState::CleaningUp, LiveId(1));
+        assert_eq!(fail_playback(&mut state, &mut id, LiveId(2)), None);
+        assert_eq!(state, PlaybackState::Unprepared);
+        assert_eq!(id, LiveId(2));
+    }
+
+    /// Stopping releases a held player, once.
+    #[test]
+    fn stop_releases_only_a_held_player() {
+        assert!(stop_releases(&PlaybackState::Playing));
+        assert!(stop_releases(&PlaybackState::Preparing));
+        assert!(!stop_releases(&PlaybackState::Unprepared));
+        assert!(!stop_releases(&PlaybackState::CleaningUp));
+    }
 }
