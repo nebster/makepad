@@ -43,6 +43,14 @@ pub(super) fn connector_rank(name: &str) -> (u8, String) {
     (if builtin { 0 } else { 1 }, name.to_owned())
 }
 
+/// Whether a connector (its sysfs name after `cardN-`) can be a monitor. A
+/// Writeback connector is the display engine's capture target: DRM lists it,
+/// and sysfs reads it `connected` with modes, but nothing is attached to it,
+/// so driving it as a screen adds an invisible one to the desktop.
+pub(super) fn is_monitor_connector(connector: &str) -> bool {
+    !connector.starts_with("Writeback")
+}
+
 pub(super) fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
     for byte in bytes {
         hash ^= *byte as u64;
@@ -105,6 +113,9 @@ pub(super) fn scan_sysfs_connectors(
             continue;
         };
         if !card.starts_with("card") || !card[4..].chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        if !is_monitor_connector(connector) {
             continue;
         }
         let card_path = PathBuf::from("/dev/dri").join(card);
@@ -645,6 +656,35 @@ pub(super) fn choose_output_format(formats: &[vk::SurfaceFormatKHR]) -> Result<v
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_writeback_connector_is_not_a_monitor() {
+        assert!(!super::is_monitor_connector("Writeback-1"));
+        for monitor in ["HDMI-A-1", "HDMI-A-2", "DP-1", "eDP-1", "DVI-D-1", "Virtual-1"] {
+            assert!(super::is_monitor_connector(monitor), "{monitor}");
+        }
+    }
+
+    /// An AMD iGPU lists a connected Writeback connector next to its HDMI
+    /// port; only the HDMI port is a screen.
+    #[test]
+    fn the_scan_skips_a_connected_writeback_connector() {
+        let root = std::env::temp_dir().join(format!("makepad-hal-sysfs-writeback-{}", std::process::id()));
+        for (name, id) in [("card1-HDMI-A-1", 393u32), ("card1-Writeback-1", 410)] {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("connector_id"), id.to_string()).unwrap();
+            std::fs::write(dir.join("status"), "connected\n").unwrap();
+            std::fs::write(dir.join("edid"), [id as u8; 128]).unwrap();
+        }
+        let names: Vec<String> = super::scan_sysfs_connectors(&root, &Default::default(), |_, _| {})
+            .unwrap()
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(names, vec!["card1-HDMI-A-1".to_string()]);
+    }
+
     #[test]
     fn the_monitor_name_comes_from_the_edid_name_descriptor() {
         let mut edid = vec![0u8; 128];
