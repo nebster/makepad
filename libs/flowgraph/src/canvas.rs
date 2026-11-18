@@ -110,9 +110,6 @@ const AUTO_FLIP_MAX_PASSES: usize = 3;
 const CROSSING_COST: f64 = 400.0;
 const BEND_COST: f64 = 120.0;
 const LOOP_COST: f64 = 300.0;
-const FRAME_RADIUS: f32 = 22.0;
-const FRAME_BODY_ALPHA: f32 = 0.16;
-const FRAME_HEADER_ALPHA: f32 = 0.30;
 const FRAME_TITLE_PAD: f64 = 18.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -123,15 +120,15 @@ struct CardOutlineGeometry {
 }
 
 /// The shader strokes the body's own SDF shape. Its outer edge is therefore
-/// exactly this much larger than the body while retaining `CARD_RADIUS`.
-fn card_outline_geometry(body_rect: Rect, zoom: f64) -> CardOutlineGeometry {
+/// exactly this much larger than the body while retaining the card's radius.
+fn card_outline_geometry(body_rect: Rect, zoom: f64, radius: f32) -> CardOutlineGeometry {
     let stroke_width = CARD_OUTLINE_PX / zoom.max(0.01);
     CardOutlineGeometry {
         outer_rect: Rect {
             pos: body_rect.pos - dvec2(stroke_width, stroke_width),
             size: body_rect.size + dvec2(stroke_width * 2.0, stroke_width * 2.0),
         },
-        radius: CARD_RADIUS,
+        radius,
         stroke_width: stroke_width as f32,
     }
 }
@@ -365,6 +362,11 @@ script_mod! {
         card_edge_color: theme.flow_edge
         accent_color: theme.flow_accent
         highlight_color: theme.flow_highlight
+        card_radius: 16.0
+        frame_radius: 22.0
+        frame_border_size: 1.5
+        frame_body_alpha: 0.16
+        frame_header_alpha: 0.30
         color_input: theme.flow_input
         color_output: theme.flow_success
         color_chat: theme.flow_chat
@@ -1099,6 +1101,21 @@ pub struct FlowCanvas {
     accent_color: Vec4f,
     #[live]
     highlight_color: Vec4f,
+    /// Corner radius of a card's body and its selection outline. Layout
+    /// (card height, inner insets) keeps `CARD_RADIUS`.
+    #[live]
+    card_radius: f32,
+    /// Corner radius of a group frame's body and header band.
+    #[live]
+    frame_radius: f32,
+    /// Width of a group frame's border.
+    #[live]
+    frame_border_size: f32,
+    /// How much of a frame's tint covers its body, and its header band.
+    #[live]
+    frame_body_alpha: f32,
+    #[live]
+    frame_header_alpha: f32,
     #[live]
     color_input: Vec4f,
     #[live]
@@ -3950,14 +3967,14 @@ impl FlowCanvas {
             let rect = self.frame_rect(graph, index);
             let tint = self.frame_tint(&frame.kind);
             let is_selected = selected == Some(frame.id.as_str());
-            self.draw_frame.color = alpha(tint, FRAME_BODY_ALPHA);
+            self.draw_frame.color = alpha(tint, self.frame_body_alpha);
             self.draw_frame.border_color = tint;
-            self.draw_frame.border_size = 1.5;
-            self.draw_frame.border_radius = FRAME_RADIUS;
+            self.draw_frame.border_size = self.frame_border_size;
+            self.draw_frame.border_radius = self.frame_radius;
             self.draw_frame.outline_color = self.accent_color;
             self.draw_frame.outline_size = if is_selected { outline } else { 0.0 };
             self.draw_frame.draw_abs(cx, rect);
-            self.draw_frame.color = alpha(tint, FRAME_HEADER_ALPHA);
+            self.draw_frame.color = alpha(tint, self.frame_header_alpha);
             self.draw_frame.outline_size = 0.0;
             self.draw_frame.draw_abs(
                 cx,
@@ -4013,7 +4030,7 @@ impl FlowCanvas {
         for index in indices.iter().copied() {
             let node = &graph.nodes[index];
             let rect = self.card_rect(graph, index);
-            let outline = card_outline_geometry(rect, self.camera.scale);
+            let outline = card_outline_geometry(rect, self.camera.scale, self.card_radius);
             let highlighted = self.highlight.as_deref() == Some(node.id.as_str());
             let waiting = self.statuses.get(&node.id).map(|s| s.state.as_str()) == Some("waiting");
             self.draw_card.color = if hover == Some(index) {
@@ -4510,11 +4527,11 @@ impl FlowCanvas {
             let y = local.y as f32;
             self.draw_over.set_color(1.0, 1.0, 1.0, 0.06);
             self.draw_over
-                .rounded_rect(x, y, NODE_WIDTH as f32, 120.0, CARD_RADIUS);
+                .rounded_rect(x, y, NODE_WIDTH as f32, 120.0, self.card_radius);
             self.draw_over.fill();
             Self::set_color(&mut self.draw_over, self.accent_color, 0.9);
             self.draw_over
-                .rounded_rect(x, y, NODE_WIDTH as f32, 120.0, CARD_RADIUS);
+                .rounded_rect(x, y, NODE_WIDTH as f32, 120.0, self.card_radius);
             self.draw_over.stroke(1.5);
         }
         self.draw_over.end(cx);
@@ -4679,11 +4696,17 @@ mod tests {
             pos: dvec2(100.0, 200.0),
             size: dvec2(300.0, 220.0),
         };
-        let outline = card_outline_geometry(body, 0.5);
+        let outline = card_outline_geometry(body, 0.5, CARD_RADIUS);
         assert_eq!(outline.radius, CARD_RADIUS);
         assert_eq!(outline.stroke_width, 4.0);
         assert_eq!(outline.outer_rect.pos, dvec2(96.0, 196.0));
         assert_eq!(outline.outer_rect.size, dvec2(308.0, 228.0));
+    }
+
+    #[test]
+    fn card_outline_takes_the_card_radius_it_is_given() {
+        let body = Rect { pos: dvec2(0.0, 0.0), size: dvec2(100.0, 80.0) };
+        assert_eq!(card_outline_geometry(body, 1.0, 2.0).radius, 2.0);
     }
 
     #[test]
