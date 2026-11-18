@@ -133,6 +133,13 @@ fn card_outline_geometry(body_rect: Rect, zoom: f64, radius: f32) -> CardOutline
     }
 }
 
+/// The kind strip along a card's left edge: `width` wide (at most the
+/// card's width) and the card's full height, or none when `width` is not
+/// positive.
+fn card_strip_rect(body_rect: Rect, width: f64) -> Option<Rect> {
+    (width > 0.0).then(|| Rect { pos: body_rect.pos, size: dvec2(width.min(body_rect.size.x), body_rect.size.y) })
+}
+
 fn is_interactive_face_type(type_id: ScriptTypeId) -> bool {
     type_id == <TextInput as ScriptNew>::script_type_id_static()
         || type_id == <FabValueInput as ScriptNew>::script_type_id_static()
@@ -337,6 +344,10 @@ script_mod! {
             shadow_radius: 0.0
             shadow_color: #0000
         }
+        draw_strip +: {
+            shadow_radius: 0.0
+            shadow_color: #0000
+        }
         draw_title +: {
             text_style: theme.font_bold{font_size: 10.5}
             color: theme.flow_text
@@ -367,6 +378,7 @@ script_mod! {
         frame_border_size: 1.5
         frame_body_alpha: 0.16
         frame_header_alpha: 0.30
+        card_strip_width: 0.0
         color_input: theme.flow_input
         color_output: theme.flow_success
         color_chat: theme.flow_chat
@@ -1077,6 +1089,10 @@ pub struct FlowCanvas {
     /// Group frame bodies and header bands: the card shader without a shadow.
     #[live]
     draw_frame: DrawFlowCard,
+    /// The strip in each card's node-style colour along its left edge, over
+    /// the body (`card_strip_width`): the card shader without a shadow.
+    #[live]
+    draw_strip: DrawFlowCard,
     #[live]
     draw_vec: DrawVector,
     #[live]
@@ -1116,6 +1132,10 @@ pub struct FlowCanvas {
     frame_body_alpha: f32,
     #[live]
     frame_header_alpha: f32,
+    /// Width of the strip in each card's node-style colour along its left
+    /// edge, in world units; 0 (the default) draws none.
+    #[live]
+    card_strip_width: f32,
     #[live]
     color_input: Vec4f,
     #[live]
@@ -4067,6 +4087,18 @@ impl FlowCanvas {
             };
             self.draw_card.draw_abs(cx, rect);
         }
+        if self.card_strip_width > 0.0 {
+            self.draw_strip.border_size = 0.0;
+            self.draw_strip.outline_size = 0.0;
+            self.draw_strip.border_radius = self.card_radius.min(self.card_strip_width);
+            for index in indices.iter().copied() {
+                let Some(strip) = card_strip_rect(self.card_rect(graph, index), self.card_strip_width as f64) else {
+                    continue;
+                };
+                self.draw_strip.color = self.kind_color(&graph.nodes[index].kind);
+                self.draw_strip.draw_abs(cx, strip);
+            }
+        }
     }
 
     fn kind_icon(&mut self, kind: &str) -> Option<&mut DrawSvg> {
@@ -4701,6 +4733,16 @@ mod tests {
         assert_eq!(outline.stroke_width, 4.0);
         assert_eq!(outline.outer_rect.pos, dvec2(96.0, 196.0));
         assert_eq!(outline.outer_rect.size, dvec2(308.0, 228.0));
+    }
+
+    #[test]
+    fn card_strip_spans_the_left_edge_or_is_none() {
+        let body = Rect { pos: dvec2(10.0, 20.0), size: dvec2(100.0, 80.0) };
+        let strip = card_strip_rect(body, 4.0).unwrap();
+        assert_eq!((strip.pos, strip.size), (dvec2(10.0, 20.0), dvec2(4.0, 80.0)));
+        assert_eq!(card_strip_rect(body, 500.0).unwrap().size, dvec2(100.0, 80.0));
+        assert!(card_strip_rect(body, 0.0).is_none());
+        assert!(card_strip_rect(body, -1.0).is_none());
     }
 
     #[test]
